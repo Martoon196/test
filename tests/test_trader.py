@@ -73,6 +73,10 @@ def setup(tmp_path, bid=2040.0, ask=2040.3):
     config.MAX_DAILY_LOSS_PERCENT, config.MAX_OPEN_SIGNALS = 5.0, 3
     config.MAX_SPREAD_PIPS, config.SPREAD_WAIT_SEC, config.KILL_SWITCH_LOSS_PERCENT = 0, 0, 10.0
     config.GROUP_SETTINGS = {}
+    config.TRADING_DAYS, config.TRADING_HOURS_UTC = "", ""
+    config.MAX_OPEN_PER_SYMBOL_DIRECTION, config.DUPLICATE_WINDOW_MIN, config.TIME_STOP_HOURS = 0, 0, 0
+    config.MIN_RR, config.MAX_SL_PIPS, config.MIN_SL_PIPS, config.SKIP_IF_TP1_PASSED = 0, 0, 0, False
+    config.ACCOUNTS = []
     db.reset()
     db.init_db()
     broker = FakeBroker(bid, ask)
@@ -248,3 +252,81 @@ def test_daily_loss_limit_survives_restart(tmp_path):
     trader2 = Trader(broker, trader.notify)
     run(trader2.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
     assert "daily loss" in db.get_signal(1)["error_message"]
+
+
+def test_exposure_cap_across_groups(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.MAX_OPEN_PER_SYMBOL_DIRECTION = 1
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "Group A", 10, "x"))
+    run(trader.open_signal(parse_signal("GOLD BUY 2041 SL 2031 TP 2046"), 2, "Group B", 10, "x"))
+    run(trader.open_signal(parse_signal("GOLD SELL 2041 SL 2051 TP 2030"), 3, "Group C", 10, "x"))
+    assert db.get_signal(2)["status"] == "SKIPPED" and "Group A" in db.get_signal(2)["error_message"]
+    assert db.get_signal(3)["status"] == "OPEN"          # other direction is fine
+
+
+def test_repost_of_same_trade_is_skipped(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.DUPLICATE_WINDOW_MIN = 240
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050"), 1, "G", 11, "x"))
+    assert "re-post of #1" in db.get_signal(2)["error_message"]
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2025 TP 2045"), 1, "G", 12, "x"))   # different stop = new trade
+    assert db.get_signal(3)["status"] == "OPEN"
+
+
+def test_session_filter(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.TRADING_HOURS_UTC = "00:00-00:01"
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    assert "TRADING_HOURS_UTC" in db.get_signal(1)["error_message"] or db.get_signal(1)["status"] == "OPEN"
+
+
+def test_level_filters_and_tp1_passed(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.MIN_RR = 1.0
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2043"), 1, "G", 10, "x"))
+    assert "MIN_RR" in db.get_signal(1)["error_message"]
+    config.MIN_RR, config.MAX_SL_PIPS = 0, 50
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2060"), 1, "G", 11, "x"))
+    assert "MAX_SL_PIPS" in db.get_signal(2)["error_message"]
+    config.MAX_SL_PIPS, config.SKIP_IF_TP1_PASSED = 0, True
+    broker.bid, broker.ask = 2046.0, 2046.3                           # already through TP1 2045
+    run(trader.open_signal(parse_signal("GOLD BUY 2045 SL 2035 TP1 2045.5 TP2 2050"), 1, "G", 12, "x"))
+    assert "TP1" in db.get_signal(3)["error_message"]
+
+
+def test_time_stop_closes_stale_trade(tmp_path):
+    trader, broker, notes = setup(tmp_path)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    config.TIME_STOP_HOURS = 2
+    run(trader._manage_once())
+    assert broker.positions_                                           # too young
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    db.conn().execute("UPDATE signals SET created_at = ? WHERE id = 1", (old,))
+    run(trader._manage_once())
+    assert broker.positions_ == [] and any("time stop" in n for n in notes)
+
+
+def test_latency_is_recorded(tmp_path):
+    trader, broker, notes = setup(tmp_path)
+    sent = datetime.now(timezone.utc) - timedelta(milliseconds=800)
+    received = datetime.now(timezone.utc)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x", sent, received))
+    row = db.get_signal(1)
+    assert 700 <= row["latency_ms"] <= 2000 and row["exec_ms"] is not None and row["exec_ms"] >= 0
+    assert "⏱" in notes[-1]
+
+
+def test_account_overrides_and_lot_multiplier(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.ACCOUNTS = [{"id": "a", "name": "own"}, {"id": "b", "name": "prop", "lot_multiplier": 3, "max_open_signals": 1}]
+    prop = Trader(broker, trader.notify, config.accounts()[1])
+    assert prop.tag == "[prop] "
+    run(prop.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050"), 1, "G", 10, "x"))
+    assert [c[3] for c in broker.calls] == [0.03, 0.03]
+    run(prop.open_signal(parse_signal("GOLD BUY 2041 SL 2031 TP 2050"), 2, "H", 10, "x"))
+    assert "MAX_OPEN_SIGNALS" in db.get_signal(2)["error_message"]
+    assert db.get_signal(1)["account"] == "prop"
+    # the other account can still take the same message
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050"), 1, "G", 10, "x"))
+    assert db.get_signal(3)["account"] == "main"

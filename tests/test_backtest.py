@@ -89,3 +89,35 @@ def test_csv_candles(tmp_path):
                    "2025.10.01\t09:00:00\t2040.0\t2041.0\t2039.5\t2040.5\t100\t0\t20\n")
     cs = backtest.load_csv_candles(mt5)
     assert cs[0]["time"] == T0 and cs[0]["high"] == 2041.0
+
+
+def test_filters_drop_signals_before_simulating():
+    messages = [msg(1, 10, 0, SIGNAL), msg(1, 11, 60 * 14, "XAUUSD BUY 2040 SL 2030 TP 2042")]   # 23:00 UTC, poor R:R
+    _, results, _ = backtest.run_backtest(messages, path_candles() + [candle(60 * 14 + m, 2029, 2029.5, 2028.5, 2029) for m in range(3)],
+                                          "XAUUSD", {"v": SimConfig()}, 2, 48, T0, T0 + timedelta(days=1),
+                                          filters={"hours": "07:00-20:00", "min_rr": 1.0})
+    assert [s["message_id"] for s, _ in results["v"]] == [10]
+
+
+def test_walk_forward_picks_settings_and_judges_out_of_sample():
+    # 20 identical signals over 20 days on a path where TP1 hits, price returns to BE, then hits the SL:
+    # the staged stop wins everywhere, so the optimizer must keep a staged config and mark it ✅.
+    candles, messages = [], []
+    for day in range(20):
+        offset = day * 24 * 60
+        candles += [{**c, "time": c["time"] + timedelta(minutes=offset)} for c in path_candles()]
+        messages.append(msg(1, day, offset, SIGNAL))
+    grid = backtest.build_grid([5, 20], [1, 3], [0], include_plain=True, tolerance=20, expiry_min=240)
+    plain = SimConfig(staged=False, tolerance_pips=20, expiry_min=240, max_tps=3)
+    rows = backtest.walk_forward(messages, candles, "XAUUSD", grid, plain, 2, 48, T0, T0 + timedelta(days=20),
+                                 split=0.5, min_train=5)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["train_n"] == 10 and row["test_n"] == 10
+    assert row["best"].startswith("BE+") and row["keep"] is True
+    assert row["test_r"] > row["test_base_r"]
+    assert row["settings"]["max_tps"] in (1, 3) and "be_buffer_pips" in row["settings"]
+    assert backtest.fmt_opt_row(row).endswith("✅ |")
+    thin = backtest.walk_forward(messages[:3], candles, "XAUUSD", grid, plain, 2, 48, T0, T0 + timedelta(days=20),
+                                 split=0.5, min_train=5)
+    assert "note" in thin[0]

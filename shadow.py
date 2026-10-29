@@ -17,9 +17,13 @@ from simulator import SimConfig, SimTrade
 log = logging.getLogger("shadow")
 
 
-def sim_config():
-    return SimConfig(be_buffer_pips=config.BE_BUFFER_PIPS, tolerance_pips=config.MARKET_TOLERANCE_PIPS,
-                     expiry_min=config.PENDING_EXPIRY_MIN, max_tps=config.MAX_TPS)
+def sim_config(settings=None):
+    """The live rules for this group: global defaults with the group's own overrides (/group ... be 10 etc.)."""
+    settings = settings or {}
+    return SimConfig(be_buffer_pips=float(settings.get("be_buffer_pips", config.BE_BUFFER_PIPS)),
+                     tolerance_pips=config.MARKET_TOLERANCE_PIPS, expiry_min=config.PENDING_EXPIRY_MIN,
+                     max_tps=int(settings.get("max_tps", config.MAX_TPS)),
+                     time_stop_hours=float(settings.get("time_stop_hours", config.TIME_STOP_HOURS) or 0))
 
 
 class Shadow:
@@ -41,8 +45,9 @@ class Shadow:
             log.warning("Shadow: can't price %s (%s), not tracking this symbol", symbol, e)
             self._skip.add(symbol)
             return None
+        settings = db.group_settings(chat_id, group_name, config.GROUP_SETTINGS)
         trade = SimTrade(signal, datetime.now(timezone.utc), price["bid"], price["ask"],
-                         pip_size(symbol, spec), sim_config())
+                         pip_size(symbol, spec), sim_config(settings))
         shadow_id = db.create_shadow(chat_id, group_name, message_id, signal.symbol, trade)
         log.info("Shadow #%s: %s %s %s from %s", shadow_id, trade.order_type, signal.direction, signal.symbol, group_name)
         return shadow_id

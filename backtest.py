@@ -26,6 +26,7 @@ from pathlib import Path
 import config
 import tg_export
 from broker import pip_size
+from filters import in_trading_window, level_reason
 from signal_parser import is_close_message, parse_signal, partial_close_fraction
 from simulator import SimConfig, SimTrade, step_candle
 
@@ -216,12 +217,32 @@ HEADER = ("| group                        | sigs | trd  | win%   | TP1%   | full
 
 
 # ---------------------------------------------------------------------------- main
-def run_backtest(messages, candles, symbol, variants, spread_pips, max_hours, start, end, pip=None):
+def apply_filters(signals, candles, times, pip, filters):
+    """Drop signals the live filters would skip (session, R:R, stop distance). Returns (kept, reasons)."""
+    kept, reasons = [], {}
+    for s in signals:
+        ok, why = in_trading_window(s["time"], filters.get("hours", ""), filters.get("days", ""))
+        if ok:
+            i = first_candle_at_or_after(candles, times, s["time"])
+            price = candles[i]["open"] if i is not None else (s["signal"].reference_price or s["signal"].sl)
+            why = level_reason(price, s["signal"].sl, s["signal"].tps, pip, filters.get("min_rr", 0),
+                               filters.get("max_sl_pips", 0), filters.get("min_sl_pips", 0))
+        if why:
+            key = why.split("(")[0].split(" is ")[0].strip()
+            reasons[key] = reasons.get(key, 0) + 1
+        else:
+            kept.append(s)
+    return kept, reasons
+
+
+def run_backtest(messages, candles, symbol, variants, spread_pips, max_hours, start, end, pip=None, filters=None):
     signals, closes = collect_signals(messages, symbol, start, end)
     attach_close_times(signals, closes)
     pip = pip or pip_size(symbol)
     spread = spread_pips * pip
     times = [c["time"] for c in candles]
+    if filters:
+        signals, _ = apply_filters(signals, candles, times, pip, filters)
     results = {}  # variant name -> list of (signal message, trade)
     skipped = 0
     for name, cfg in variants.items():
@@ -234,6 +255,91 @@ def run_backtest(messages, candles, symbol, variants, spread_pips, max_hours, st
             trades.append((s, simulate(s["signal"], candles, i, cfg, pip, spread, max_hours, s.get("close_at"))))
         results[name] = trades
     return signals, results, skipped // max(len(variants), 1)
+
+
+# ---------------------------------------------------------------------------- per-group optimizer
+def build_grid(be_buffers, tps_list, time_stops, include_plain=True, tolerance=None, expiry_min=None):
+    """Every combination of the knobs the live bot has per group."""
+    tolerance = config.MARKET_TOLERANCE_PIPS if tolerance is None else tolerance
+    expiry_min = config.PENDING_EXPIRY_MIN if expiry_min is None else expiry_min
+    grid = {}
+    for tps in tps_list:
+        for ts in time_stops:
+            suffix = f" tps{tps}" + (f" stop{ts:g}h" if ts else "")
+            for be in be_buffers:
+                grid[f"BE+{be:g}{suffix}"] = SimConfig(be_buffer_pips=be, tolerance_pips=tolerance, expiry_min=expiry_min,
+                                                       max_tps=tps, time_stop_hours=ts)
+            if include_plain:
+                grid[f"plain{suffix}"] = SimConfig(tolerance_pips=tolerance, expiry_min=expiry_min, max_tps=tps,
+                                                   staged=False, time_stop_hours=ts)
+    return grid
+
+
+def grid_to_settings(cfg):
+    settings = {"max_tps": cfg.max_tps, "be_buffer_pips": cfg.be_buffer_pips if cfg.staged else 0}
+    if cfg.time_stop_hours:
+        settings["time_stop_hours"] = cfg.time_stop_hours
+    return settings
+
+
+def walk_forward(messages, candles, symbol, grid, baseline, spread_pips, max_hours, start, end, split=0.6,
+                 min_train=15, pip=None, filters=None):
+    """Per group: choose the grid entry with the best total R on the first `split` of the period, then report
+    how it did on the rest, next to the default settings. Only the out-of-sample number means anything."""
+    signals, closes = collect_signals(messages, symbol, start, end)
+    attach_close_times(signals, closes)
+    pip = pip or pip_size(symbol)
+    spread = spread_pips * pip
+    times = [c["time"] for c in candles]
+    if filters:
+        signals, _ = apply_filters(signals, candles, times, pip, filters)
+    cut = start + (end - start) * split
+
+    def run(sigs, cfg):
+        rs = []
+        for s in sigs:
+            i = first_candle_at_or_after(candles, times, s["time"])
+            if i is None or candles[i]["time"] - s["time"] > timedelta(hours=6):
+                continue
+            t = simulate(s["signal"], candles, i, cfg, pip, spread, max_hours, s.get("close_at"))
+            if t.result != "EXPIRED":
+                rs.append(t.r)
+        return rs
+
+    by_group = defaultdict(list)
+    for s in signals:
+        by_group[s["chat_name"]].append(s)
+
+    rows = []
+    for group, sigs in sorted(by_group.items()):
+        train = [s for s in sigs if s["time"] < cut]
+        test = [s for s in sigs if s["time"] >= cut]
+        row = {"group": group, "train_n": len(train), "test_n": len(test)}
+        if len(train) < min_train:
+            row["note"] = f"only {len(train)} training signals (need {min_train})"
+            rows.append(row)
+            continue
+        scores = {name: run(train, cfg) for name, cfg in grid.items()}
+        best_name = max(scores, key=lambda n: (sum(scores[n]), -len(n)))
+        base_test, best_test = run(test, baseline), run(test, grid[best_name])
+        row.update({"best": best_name, "train_r": sum(scores[best_name]), "train_base_r": sum(run(train, baseline)),
+                    "test_r": sum(best_test), "test_base_r": sum(base_test),
+                    "settings": grid_to_settings(grid[best_name]),
+                    "keep": bool(test) and sum(best_test) > sum(base_test) and sum(best_test) > 0})
+        rows.append(row)
+    return rows
+
+
+OPT_HEADER = ("| group                        | train | best settings              | train R | default | test | test R | default |\n"
+              "|------------------------------|-------|----------------------------|---------|---------|------|--------|---------|")
+
+
+def fmt_opt_row(r):
+    if "best" not in r:
+        return f"| {r['group'][:28]:<28} | {r['train_n']:>5} | {r['note'][:26]:<26} |         |         | {r['test_n']:>4} |        |         |"
+    mark = " ✅" if r["keep"] else ""
+    return (f"| {r['group'][:28]:<28} | {r['train_n']:>5} | {r['best'][:26]:<26} | {r['train_r']:>+7.1f} | {r['train_base_r']:>+7.1f} "
+            f"| {r['test_n']:>4} | {r['test_r']:>+6.1f} | {r['test_base_r']:>+7.1f}{mark} |")
 
 
 def main():
@@ -250,8 +356,25 @@ def main():
     ap.add_argument("--max-tps", type=int, default=config.MAX_TPS)
     ap.add_argument("--max-hours", type=float, default=48, help="give up on a trade still open after this")
     ap.add_argument("--out", default="backtest_trades.csv", help="per-trade CSV (default backtest_trades.csv)")
+    flt = ap.add_argument_group("filters (same as the live TRADING_HOURS_UTC / MIN_RR / MAX_SL_PIPS settings)")
+    flt.add_argument("--hours", default="", help='e.g. "07:00-20:00" UTC')
+    flt.add_argument("--days", default="", help='e.g. "mon-fri"')
+    flt.add_argument("--min-rr", type=float, default=0)
+    flt.add_argument("--max-sl-pips", type=float, default=0)
+    flt.add_argument("--min-sl-pips", type=float, default=0)
+    opt = ap.add_argument_group("per-group optimizer (walk-forward)")
+    opt.add_argument("--optimize", action="store_true", help="find each group's best BE buffer / TP count / time stop")
+    opt.add_argument("--split", type=float, default=0.6, help="share of the period used to choose settings (default 0.6)")
+    opt.add_argument("--min-train", type=int, default=15, help="groups with fewer training signals are skipped")
+    opt.add_argument("--grid-be", default="0,5,10,20", help="BE buffers to try")
+    opt.add_argument("--grid-tps", default="1,2,3", help="TP counts to try")
+    opt.add_argument("--grid-timestop", default="0,4,12,24", help="time stops (hours) to try, 0 = none")
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING)
+    filters = {"hours": args.hours, "days": args.days, "min_rr": args.min_rr, "max_sl_pips": args.max_sl_pips,
+               "min_sl_pips": args.min_sl_pips}
+    if not any(filters.values()):
+        filters = None
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end = (datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc) + timedelta(days=1)
@@ -275,9 +398,29 @@ def main():
         raise SystemExit("No candles for that period")
     print(f"{len(candles)} candles from {candles[0]['time']:%Y-%m-%d %H:%M} to {candles[-1]['time']:%Y-%m-%d %H:%M}")
 
+    if args.optimize:
+        grid = build_grid([float(x) for x in args.grid_be.split(",")], [int(x) for x in args.grid_tps.split(",")],
+                          [float(x) for x in args.grid_timestop.split(",")], tolerance=args.tolerance)
+        baseline = SimConfig(be_buffer_pips=config.BE_BUFFER_PIPS, tolerance_pips=args.tolerance,
+                             expiry_min=config.PENDING_EXPIRY_MIN, max_tps=args.max_tps)
+        rows = walk_forward(messages, candles, args.symbol, grid, baseline, args.spread_pips, args.max_hours,
+                            start, end, args.split, args.min_train, filters=filters)
+        print(f"\n### Walk-forward optimizer: settings chosen on the first {args.split:.0%} of the period, "
+              f"judged on the rest ({len(grid)} combinations per group)\n{OPT_HEADER}")
+        for r in rows:
+            print(fmt_opt_row(r))
+        keep = {r["group"]: r["settings"] for r in rows if r.get("keep")}
+        if keep:
+            print("\n✅ = beat the default settings out of sample AND made money. GROUP_SETTINGS to paste into Railway:")
+            print(json.dumps(keep, indent=2))
+        else:
+            print("\nNo group beat the default settings out of sample - keep the defaults (that is a real result).")
+        return
+
     signals, results, skipped = run_backtest(messages, candles, args.symbol, variants, args.spread_pips,
-                                             args.max_hours, start, end)
-    print(f"{len(signals)} {args.symbol} signals in range" + (f", {skipped} outside candle data" if skipped else ""))
+                                             args.max_hours, start, end, filters=filters)
+    print(f"{len(signals)} {args.symbol} signals in range" + (f", {skipped} outside candle data" if skipped else "")
+          + (" (after filters)" if filters else ""))
 
     for name, trades in results.items():
         print(f"\n### {name}\n{HEADER}")

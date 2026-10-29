@@ -17,6 +17,7 @@ class SimConfig:
     expiry_min: int = 240           # cancel a pending order after this
     max_tps: int = 3
     staged: bool = True             # False = plain SL/TP, no trailing (for comparison in backtests)
+    time_stop_hours: float = 0.0    # close whatever is still open after this long. 0 = never
 
 
 def choose_order(signal, current, pip, tolerance_pips):
@@ -97,6 +98,12 @@ class SimTrade:
             events.append("FILLED")
 
         price = bid if buy else ask     # the side you close at
+
+        if self.cfg.time_stop_hours and self.opened_at and time - self.opened_at >= timedelta(hours=self.cfg.time_stop_hours):
+            for leg in self.open_legs():
+                self._close_leg(leg, price, "TIME_STOP")
+            self._finish("TIME_STOP", time)
+            return self._record(time, events + ["TIME_STOP"])
 
         # Stop loss is checked first: if a tick reaches both SL and TP we assume the worst.
         if (buy and price <= self.sl) or (not buy and price >= self.sl):

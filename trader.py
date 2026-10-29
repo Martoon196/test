@@ -1,17 +1,21 @@
-"""Opens, manages and closes trades. Every MetaAPI order is tagged with clientId "TG<signal>_<leg>",
-so we always know exactly which positions belong to which signal (the old code guessed by
-"symbol + open price within 1.0", which mixed up trades and never worked for market orders)."""
+"""Opens, manages and closes trades on ONE account. Every MetaAPI order is tagged with clientId
+"TG<signal>_<leg>", so we always know exactly which positions belong to which signal (the old code guessed
+by "symbol + open price within 1.0", which mixed up trades and never worked for market orders).
+
+With several accounts (ACCOUNTS) the bot runs one Trader per account and fans every signal out to all of them.
+"""
 import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from metaapi_cloud_sdk.clients.metaapi.trade_exception import TradeException
 
 import config
 import db
 from broker import pip_size
+from filters import in_trading_window, level_reason
 from simulator import choose_order
 
 log = logging.getLogger("trader")
@@ -40,36 +44,51 @@ def _floor_step(volume, step):
     return round(math.floor(volume / step + 1e-9) * step, 8)
 
 
+def _ms(a, b):
+    return int((b - a).total_seconds() * 1000)
+
+
 class Trader:
-    def __init__(self, broker, notify):
+    def __init__(self, broker, notify, account=None):
         self.broker = broker
         self.notify = notify                 # async fn(text) -> sends a Telegram message to you
-        self.paused = False
+        self.account = account or config.accounts()[0]
+        self.name = self.account["name"]
+        self.tag = f"[{self.name}] " if len(config.accounts()) > 1 else ""
+        self.paused = not self.account.get("enabled", True)
         self.kill_switch_tripped = False
         self._lock = asyncio.Lock()          # one signal at a time, so limits can't be raced
         self._last_account_check = None
         self._last_snapshot = None
+        self.wake = getattr(broker, "wake", None) or asyncio.Event()
+
+    def setting(self, key):
+        """Account override if it has one, else the global setting (LOT_SIZE, RISK_PERCENT, ...)."""
+        value = self.account.get(key)
+        return value if value is not None else getattr(config, key.upper())
 
     # ------------------------------------------------------------------ opening
-    async def open_signal(self, signal, chat_id, group_name, message_id, raw_text):
+    async def open_signal(self, signal, chat_id, group_name, message_id, raw_text, msg_time=None, received_at=None):
         async with self._lock:
-            if db.signal_exists(chat_id, message_id):
+            if db.signal_exists(chat_id, message_id, self.name):
                 return
             symbol = broker_symbol(signal.symbol)
-            sid = db.create_signal(chat_id, group_name, message_id, raw_text, signal, symbol)
+            sid = db.create_signal(chat_id, group_name, message_id, raw_text, signal, symbol, self.name, msg_time)
+            if msg_time and received_at:
+                db.update_signal(sid, latency_ms=_ms(msg_time, received_at))
             try:
-                text = await self._open(sid, signal, symbol)
+                text = await self._open(sid, signal, symbol, received_at)
             except Exception as e:
                 log.exception("Signal %s failed", sid)
                 db.update_signal(sid, status="FAILED", error_message=str(e))
                 text = f"❌ #{sid} {signal.direction} {signal.symbol} failed: {e}"
-            db.log_action("OPEN", text, sid, chat_id, group_name)
-            await self.notify(f"[{group_name}]\n{text}")
+            db.log_action("OPEN", self.tag + text, sid, chat_id, group_name)
+            await self.notify(f"{self.tag}[{group_name}]\n{text}")
 
-    async def _open(self, sid, signal, symbol):
+    async def _open(self, sid, signal, symbol, received_at=None):
         row = db.get_signal(sid)
         settings = db.group_settings(row["chat_id"], row["group_name"], config.GROUP_SETTINGS)
-        reason = await self._blocked_reason(signal, settings)
+        reason = await self._blocked_reason(row, signal, settings)
         if reason:
             db.update_signal(sid, status="SKIPPED", error_message=reason)
             return f"⏭ #{sid} skipped {signal.direction} {signal.symbol}: {reason}"
@@ -93,6 +112,14 @@ class Trader:
         tps = [tp for tp in signal.tps if (tp > fill_price if buy else tp < fill_price)][:max_tps]
         if not tps:
             raise ValueError(f"all TPs already passed (price {fill_price})")
+        if config.SKIP_IF_TP1_PASSED and tps[0] != signal.tps[0]:
+            db.update_signal(sid, status="SKIPPED", error_message="TP1 already passed")
+            return (f"⏭ #{sid} skipped {signal.direction} {signal.symbol}: price {fill_price} is already through "
+                    f"TP1 {signal.tps[0]} (SKIP_IF_TP1_PASSED)")
+        why = level_reason(fill_price, signal.sl, tps, pip, config.MIN_RR, config.MAX_SL_PIPS, config.MIN_SL_PIPS)
+        if why:
+            db.update_signal(sid, status="SKIPPED", error_message=why)
+            return f"⏭ #{sid} skipped {signal.direction} {signal.symbol}: {why}"
 
         volumes = await self._leg_volumes(len(tps), fill_price, signal.sl, spec, price, settings)
         tps = tps[:len(volumes)]
@@ -110,6 +137,8 @@ class Trader:
             try:
                 result = await self.broker.open(order_type, signal.direction, symbol, volume,
                                                 open_price, signal.sl, tp, cid)
+                if placed == 0 and received_at:
+                    db.update_signal(sid, exec_ms=_ms(received_at, datetime.now(timezone.utc)))
                 db.add_leg(sid, leg, cid, tp, volume, result.get("orderId"), result.get("positionId"),
                            "OPEN" if order_type == "MARKET" else "PENDING")
                 placed += 1
@@ -123,7 +152,11 @@ class Trader:
             return f"❌ {summary}\n" + "\n".join(errors)
         status = ("OPEN" if order_type == "MARKET" else "PENDING") if not errors else "PARTIAL"
         db.update_signal(sid, status=status, error_message="; ".join(errors))
-        return f"{'✅' if not errors else '⚠️'} {summary}" + ("\n" + "\n".join(errors) if errors else "")
+        timing = ""
+        row = db.get_signal(sid)
+        if row["latency_ms"] is not None or row["exec_ms"] is not None:
+            timing = f"\n⏱ Telegram→bot {(row['latency_ms'] or 0) / 1000:.1f}s, bot→broker {(row['exec_ms'] or 0) / 1000:.1f}s"
+        return f"{'✅' if not errors else '⚠️'} {summary}" + ("\n" + "\n".join(errors) if errors else "") + timing
 
     async def _price_when_spread_ok(self, symbol, pip):
         """Current price, after waiting (briefly) for a blown-out spread to settle. None = gave up."""
@@ -143,8 +176,8 @@ class Trader:
         step = spec.get("volumeStep") or 0.01
         min_vol = spec.get("minVolume") or 0.01
         max_vol = spec.get("maxVolume") or 100
-        risk_percent = float(settings.get("risk_percent", config.RISK_PERCENT))
-        lot_size = float(settings.get("lot_size", config.LOT_SIZE))
+        risk_percent = float(settings.get("risk_percent", self.setting("risk_percent")))
+        lot_size = float(settings.get("lot_size", self.setting("lot_size"))) * self.account.get("lot_multiplier", 1.0)
 
         if risk_percent > 0:
             info = await self.broker.account_info()
@@ -156,7 +189,7 @@ class Trader:
             total = info["balance"] * risk_percent / 100 / loss_per_lot
         else:
             total = lot_size * legs
-        total = min(total, config.MAX_LOT_PER_SIGNAL)
+        total = min(total, float(self.setting("max_lot_per_signal")))
 
         # Split across TPs. If the size is too small to split, use fewer TPs rather than breaking the order.
         while legs > 1 and _floor_step(total / legs, step) < min_vol:
@@ -166,30 +199,47 @@ class Trader:
             log.warning("Minimum lot %s means this trade risks more than RISK_PERCENT", min_vol)
         return [per_leg] * legs
 
-    async def _blocked_reason(self, signal, settings):
+    async def _blocked_reason(self, row, signal, settings):
         if self.paused:
             why = "kill switch tripped" if self.kill_switch_tripped else "bot is paused"
             return f"{why} (/resume to restart)"
         if not settings.get("enabled", True):
-            return "group is switched off (/group <id> on)"
+            auto = settings.get("auto_disabled")
+            return f"group is switched off ({auto}) - /group <id> on" if auto else "group is switched off (/group <id> on)"
         if config.ALLOWED_SYMBOLS and signal.symbol not in config.ALLOWED_SYMBOLS:
             return f"{signal.symbol} not in ALLOWED_SYMBOLS"
-        if len(db.open_signals()) >= config.MAX_OPEN_SIGNALS:
-            return f"already {config.MAX_OPEN_SIGNALS} open signals (MAX_OPEN_SIGNALS)"
-        if config.MAX_DAILY_LOSS_PERCENT > 0:
+        ok, why = in_trading_window(datetime.now(timezone.utc), config.TRADING_HOURS_UTC, config.TRADING_DAYS)
+        if not ok:
+            return why
+        since = (datetime.now(timezone.utc) - timedelta(minutes=config.DUPLICATE_WINDOW_MIN)).isoformat(timespec="seconds")
+        if config.DUPLICATE_WINDOW_MIN > 0:
+            dup = db.recent_similar_signal(row["chat_id"], signal.symbol, signal.direction, signal.sl, since,
+                                           self.name, exclude_id=row["id"])
+            if dup:
+                return f"re-post of #{dup['id']} (same trade from this group within {config.DUPLICATE_WINDOW_MIN} min)"
+        max_open = int(self.setting("max_open_signals"))
+        if len(db.open_signals(account=self.name)) >= max_open:
+            return f"already {max_open} open signals (MAX_OPEN_SIGNALS)"
+        cap = config.MAX_OPEN_PER_SYMBOL_DIRECTION
+        if cap > 0:
+            same = db.open_signals(account=self.name, symbol=signal.symbol, direction=signal.direction)
+            if len(same) >= cap:
+                groups = ", ".join(sorted({s["group_name"] for s in same}))
+                return f"already {signal.direction} {signal.symbol} via {groups} (MAX_OPEN_PER_SYMBOL_DIRECTION)"
+        if float(self.setting("max_daily_loss_percent")) > 0:
             loss = await self._daily_loss_percent()
-            if loss >= config.MAX_DAILY_LOSS_PERCENT:
+            if loss >= float(self.setting("max_daily_loss_percent")):
                 return f"daily loss limit hit ({loss:.1f}% down today)"
         return None
 
     async def _daily_loss_percent(self, info=None):
         """How far equity is below the balance the day started with (stored, so restarts don't reset it)."""
         info = info or await self.broker.account_info()
-        start = db.day_start_balance(datetime.now(timezone.utc).date().isoformat(), info["balance"])
+        start = db.day_start_balance(datetime.now(timezone.utc).date().isoformat(), info["balance"], self.name)
         return (start - info["equity"]) / start * 100 if start else 0.0
 
     # ------------------------------------------------------------------ group commands
-    async def close_signal(self, row, reason="CLOSED_BY_GROUP"):
+    async def close_signal(self, row, reason="CLOSED_BY_GROUP", note=""):
         positions, orders = await self._tagged()
         closed, errors = [], []
         for pos in positions.get(row["id"], []):
@@ -206,7 +256,7 @@ class Trader:
                 errors.append(str(e))
         if not errors:
             await self._settle(row, status=reason)
-        text = (f"🔒 #{row['id']} {row['symbol']} closed: " + (", ".join(closed) or "nothing was open")
+        text = (f"🔒 {self.tag}#{row['id']} {row['symbol']} closed{note}: " + (", ".join(closed) or "nothing was open")
                 + (f"\nErrors: {'; '.join(errors)}" if errors else ""))
         db.log_action("CLOSE", text, row["id"], row["chat_id"], row["group_name"])
         return text
@@ -216,7 +266,7 @@ class Trader:
         positions, _ = await self._tagged()
         open_pos = sorted(positions.get(row["id"], []), key=lambda p: parse_client_id(p["clientId"])[1] or 0)
         if not open_pos:
-            return f"⚠️ #{row['id']} {row['symbol']}: nothing open to partially close"
+            return f"⚠️ {self.tag}#{row['id']} {row['symbol']}: nothing open to partially close"
         spec = await self.broker.spec(row["broker_symbol"])
         step, min_vol = spec.get("volumeStep") or 0.01, spec.get("minVolume") or 0.01
         done, errors = [], []
@@ -236,7 +286,7 @@ class Trader:
                 done.append(f"TP{parse_client_id(pos['clientId'])[1]} leg ({pos['volume']:g} lots) closed in full")
             except Exception as e:
                 errors.append(str(e))
-        text = (f"✂️ #{row['id']} {row['symbol']} partial close ({fraction:.0%}): " + (", ".join(done) or "nothing")
+        text = (f"✂️ {self.tag}#{row['id']} {row['symbol']} partial close ({fraction:.0%}): " + (", ".join(done) or "nothing")
                 + (f"\nErrors: {'; '.join(errors)}" if errors else ""))
         db.log_action("PARTIAL", text, row["id"], row["chat_id"], row["group_name"])
         return text
@@ -244,24 +294,30 @@ class Trader:
     async def breakeven_signal(self, row):
         positions, _ = await self._tagged()
         moved = await self._move_sl(row, positions.get(row["id"], []), row["entry"])
-        text = f"🛡 #{row['id']} {row['symbol']} SL moved to entry on {moved} position(s)"
+        text = f"🛡 {self.tag}#{row['id']} {row['symbol']} SL moved to entry on {moved} position(s)"
         db.log_action("BREAKEVEN", text, row["id"], row["chat_id"], row["group_name"])
         return text
 
     async def close_all(self):
-        return [await self.close_signal(row, reason="CLOSED") for row in db.open_signals()]
+        return [await self.close_signal(row, reason="CLOSED") for row in db.open_signals(account=self.name)]
 
     # ------------------------------------------------------------------ background manager
     async def run_manager(self):
-        """Every few seconds: detect fills/TP hits, move SL in stages, expire stale pending orders."""
+        """Detect fills/TP hits, move SL in stages, expire stale pending orders, apply time stops.
+
+        Runs every MANAGER_INTERVAL_SEC, or immediately when the broker (streaming mode) reports a change."""
         while True:
             try:
                 await self._housekeeping()
-                if db.open_signals():
+                if db.open_signals(account=self.name):
                     await self._manage_once()
             except Exception:
-                log.exception("Trade manager error")
-            await asyncio.sleep(config.MANAGER_INTERVAL_SEC)
+                log.exception("[%s] Trade manager error", self.name)
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=config.MANAGER_INTERVAL_SEC)
+            except asyncio.TimeoutError:
+                pass
+            self.wake.clear()
 
     async def _housekeeping(self):
         """Kill switch + equity snapshots. Polls the account at most every 30 s."""
@@ -272,15 +328,16 @@ class Trader:
         info = await self.broker.account_info()
 
         if not self._last_snapshot or (now - self._last_snapshot).total_seconds() >= config.EQUITY_SNAPSHOT_MIN * 60:
-            db.add_equity(info["balance"], info["equity"])
+            db.add_equity(info["balance"], info["equity"], self.name)
             self._last_snapshot = now
 
-        if config.KILL_SWITCH_LOSS_PERCENT > 0 and not self.kill_switch_tripped:
+        kill = float(self.setting("kill_switch_loss_percent"))
+        if kill > 0 and not self.kill_switch_tripped:
             loss = await self._daily_loss_percent(info)
-            if loss >= config.KILL_SWITCH_LOSS_PERCENT:
+            if loss >= kill:
                 self.kill_switch_tripped = self.paused = True
                 results = await self.close_all()
-                text = (f"🛑 KILL SWITCH: equity {loss:.1f}% below today's starting balance. "
+                text = (f"🛑 {self.tag}KILL SWITCH: equity {loss:.1f}% below today's starting balance. "
                         f"Closed everything and paused. Send /resume when you've had a look.\n" + "\n".join(results))
                 db.log_action("KILL_SWITCH", text)
                 await self.notify(text)
@@ -299,7 +356,7 @@ class Trader:
 
     async def _manage_once(self):
         positions, orders = await self._tagged()
-        for row in db.open_signals():
+        for row in db.open_signals(account=self.name):
             sid = row["id"]
             open_pos, pending = positions.get(sid, []), orders.get(sid, [])
             legs = [leg for leg in db.get_legs(sid) if leg["status"] != "FAILED"]
@@ -326,11 +383,18 @@ class Trader:
                 for order in pending:
                     await self.broker.cancel_order(order["id"])
                 await self._settle(row, status="EXPIRED")
-                await self.notify(f"⌛ #{sid} {row['symbol']} pending order expired and was cancelled")
+                await self.notify(f"⌛ {self.tag}#{sid} {row['symbol']} pending order expired and was cancelled")
                 continue
 
             if pending_legs:
                 continue  # don't trail while some legs haven't even been filled yet
+
+            settings = db.group_settings(row["chat_id"], row["group_name"], config.GROUP_SETTINGS)
+            time_stop = float(settings.get("time_stop_hours", config.TIME_STOP_HOURS) or 0)
+            if time_stop and _age_seconds(row["created_at"]) > time_stop * 3600:
+                text = await self.close_signal(row, reason="CLOSED", note=f" by time stop ({time_stop:g}h)")
+                await self.notify(text)
+                continue
 
             # Legs closed in order: TP1, TP2, ... -> count how many from the front are gone.
             closed_in_order = 0
@@ -344,17 +408,18 @@ class Trader:
                 db.update_signal(sid, stage=closed_in_order)   # closed by hand/SL: don't trail on it
                 continue
 
-            await self._advance_stage(row, legs, closed_in_order, open_pos)
+            await self._advance_stage(row, legs, closed_in_order, open_pos, settings)
 
-    async def _advance_stage(self, row, legs, stage, open_pos):
+    async def _advance_stage(self, row, legs, stage, open_pos, settings):
         """Stage 1 (TP1 hit): SL -> entry + buffer.  Stage N (TPN hit): SL -> TP(N-1)."""
         buy = row["direction"] == "BUY"
         spec = await self.broker.spec(row["broker_symbol"])
         if stage == 1:
             entry = sum(p["openPrice"] * p["volume"] for p in open_pos) / sum(p["volume"] for p in open_pos)
-            buffer = config.BE_BUFFER_PIPS * pip_size(row["broker_symbol"], spec)
+            buffer_pips = float(settings.get("be_buffer_pips", config.BE_BUFFER_PIPS))
+            buffer = buffer_pips * pip_size(row["broker_symbol"], spec)
             new_sl = round(entry + buffer if buy else entry - buffer, spec.get("digits", 5))
-            label = f"break even +{config.BE_BUFFER_PIPS:g} pips"
+            label = f"break even +{buffer_pips:g} pips"
         else:
             new_sl = legs[stage - 2]["tp"]
             label = f"TP{stage - 1}"
@@ -362,7 +427,7 @@ class Trader:
         moved = await self._move_sl(row, open_pos, new_sl)
         if moved:
             db.update_signal(row["id"], stage=stage)
-            text = f"✅ #{row['id']} {row['symbol']} TP{stage} hit → SL moved to {label} ({new_sl:g})"
+            text = f"✅ {self.tag}#{row['id']} {row['symbol']} TP{stage} hit → SL moved to {label} ({new_sl:g})"
             db.log_action("STAGE", text, row["id"], row["chat_id"], row["group_name"])
             await self.notify(text)
 
@@ -414,4 +479,4 @@ class Trader:
             total += profit
         db.update_signal(row["id"], status=status, profit=round(total, 2))
         if status == "CLOSED":
-            await self.notify(f"🏁 #{row['id']} {row['symbol']} ({row['group_name']}) finished: {total:+.2f}")
+            await self.notify(f"🏁 {self.tag}#{row['id']} {row['symbol']} ({row['group_name']}) finished: {total:+.2f}")
