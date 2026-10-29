@@ -1,0 +1,305 @@
+"""Replay your groups' past signals over real 1-minute candles and see what the bot would have made.
+
+    # candles straight from your MetaAPI account (needs API_KEY + ACCOUNT_ID in the environment)
+    python backtest.py exports/ --from 2025-09-01 --to 2025-10-29
+
+    # compare staged-SL settings: BE+5 vs BE+20 vs no staged SL at all
+    python backtest.py exports/ --from 2025-09-01 --be-buffer 5 --be-buffer 20 --no-staged
+
+    # candles from a CSV instead (time,open,high,low,close - or an MT5 "Export bars" file)
+    python backtest.py exports/ --from 2025-09-01 --candles-csv XAUUSD_M1.csv
+
+Results are in R (1R = the distance from entry to the signal's stop loss), so groups and settings
+compare fairly whatever lot size you'd use. A candle that touches both SL and TP counts as a loss.
+Candles are cached in .candles/ so re-runs with different settings are instant.
+"""
+import argparse
+import asyncio
+import csv
+import json
+import logging
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import config
+import tg_export
+from broker import pip_size
+from signal_parser import is_close_message, parse_signal, partial_close_fraction
+from simulator import SimConfig, SimTrade, step_candle
+
+log = logging.getLogger("backtest")
+CACHE = Path(".candles")
+
+
+# ---------------------------------------------------------------------------- candles
+def parse_time(value):
+    """ISO 8601 ("2025-09-01 12:00:00", "2025-09-01T12:00:00Z") or unix seconds/milliseconds."""
+    value = str(value).strip()
+    if value.replace(".", "", 1).isdigit():
+        seconds = float(value)
+        return datetime.fromtimestamp(seconds / 1000 if seconds > 1e11 else seconds, tz=timezone.utc)
+    t = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def load_csv_candles(path):
+    """time,open,high,low,close CSV, or MT5 History Center export (<DATE>\\t<TIME>\\t<OPEN>...)."""
+    candles = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        sample = f.read(2048)
+        f.seek(0)
+        if "<DATE>" in sample:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                t = datetime.strptime(f"{row['<DATE>']} {row['<TIME>']}", "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                candles.append({"time": t, "open": float(row["<OPEN>"]), "high": float(row["<HIGH>"]),
+                                "low": float(row["<LOW>"]), "close": float(row["<CLOSE>"])})
+        else:
+            reader = csv.DictReader(f)
+            cols = {c.lower(): c for c in reader.fieldnames}
+            for row in reader:
+                candles.append({"time": parse_time(row[cols.get("time") or cols.get("date") or cols.get("datetime")]),
+                                "open": float(row[cols["open"]]), "high": float(row[cols["high"]]),
+                                "low": float(row[cols["low"]]), "close": float(row[cols["close"]])})
+    candles.sort(key=lambda c: c["time"])
+    return candles
+
+
+async def fetch_metaapi_candles(symbol, start, end):
+    """1-minute candles from MetaAPI, one cached file per day."""
+    from metaapi_cloud_sdk import MetaApi
+
+    CACHE.mkdir(exist_ok=True)
+    missing_days = []
+    day = start.date()
+    while day <= end.date():
+        if not (CACHE / f"{symbol}_1m_{day}.json").exists():
+            missing_days.append(day)
+        day += timedelta(days=1)
+
+    if missing_days:
+        if not config.METAAPI_TOKEN or not config.ACCOUNT_ID:
+            raise SystemExit("Need API_KEY and ACCOUNT_ID in the environment to download candles (or use --candles-csv)")
+        api = MetaApi(config.METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(config.ACCOUNT_ID)
+        if account.state != "DEPLOYED":
+            await account.deploy()
+        await account.wait_connected()
+        fetch_start = datetime.combine(missing_days[0], datetime.min.time(), tzinfo=timezone.utc)
+        fetch_end = datetime.combine(missing_days[-1] + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        print(f"Downloading {symbol} 1m candles {fetch_start:%Y-%m-%d} → {fetch_end:%Y-%m-%d} ...", file=sys.stderr)
+        got, cursor = {}, fetch_end
+        while cursor > fetch_start:
+            batch = await account.get_historical_candles(symbol, "1m", cursor, 1000)
+            if not batch:
+                break
+            for c in batch:
+                t = c["time"] if c["time"].tzinfo else c["time"].replace(tzinfo=timezone.utc)
+                got[t] = {"time": t, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]}
+            earliest = min(got)
+            if earliest >= cursor:
+                break
+            cursor = earliest - timedelta(minutes=1)
+            print(f"  ... back to {earliest:%Y-%m-%d %H:%M} ({len(got)} candles)", file=sys.stderr)
+        by_day = defaultdict(list)
+        for t, c in got.items():
+            by_day[t.date()].append(c)
+        for day in missing_days:  # write every requested day, even empty ones (weekends), so we don't refetch
+            rows = sorted(by_day.get(day, []), key=lambda c: c["time"])
+            (CACHE / f"{symbol}_1m_{day}.json").write_text(json.dumps(
+                [{**c, "time": c["time"].isoformat()} for c in rows]))
+
+    candles = []
+    day = start.date()
+    while day <= end.date():
+        for c in json.loads((CACHE / f"{symbol}_1m_{day}.json").read_text()):
+            candles.append({**c, "time": datetime.fromisoformat(c["time"])})
+        day += timedelta(days=1)
+    return candles
+
+
+# ---------------------------------------------------------------------------- simulation
+def simulate(signal, candles, start_index, cfg, pip, spread, max_hours, stop_at=None):
+    """Run one signal forward from candles[start_index]. stop_at = when the group said close."""
+    first = candles[start_index]
+    bid = first["open"]
+    trade = SimTrade(signal, first["time"], bid, bid + spread, pip, cfg)
+    deadline = first["time"] + timedelta(hours=max_hours)
+    for candle in candles[start_index:]:
+        if stop_at and candle["time"] >= stop_at:
+            trade.close(candle["time"], candle["open"], candle["open"] + spread, "MANUAL")
+            break
+        if candle["time"] > deadline:
+            trade.close(candle["time"], candle["open"], candle["open"] + spread, "TIMEOUT")
+            break
+        step_candle(trade, candle, spread)
+        if trade.status == "CLOSED":
+            break
+    if trade.status != "CLOSED":
+        last = candles[-1]
+        trade.close(last["time"], last["close"], last["close"] + spread, "TIMEOUT")
+    return trade
+
+
+def first_candle_at_or_after(candles, times, time):
+    import bisect
+    i = bisect.bisect_left(times, time)
+    return i if i < len(candles) else None
+
+
+def collect_signals(messages, symbol, start, end):
+    """Parsed signals plus the close messages that refer to them, per chat, in time order."""
+    signals, closes = [], []
+    for m in messages:
+        if not (start <= m["time"] <= end):
+            continue
+        sig = parse_signal(m["text"])
+        if sig:
+            if symbol and sig.symbol != symbol:
+                continue
+            signals.append({**m, "signal": sig})
+        elif partial_close_fraction(m["text"]) is None and is_close_message(m["text"]):
+            closes.append(m)
+    return signals, closes
+
+
+def attach_close_times(signals, closes):
+    """Mirror the bot: a reply closes that signal; a plain 'close' closes the latest earlier signal from the chat."""
+    by_chat = defaultdict(list)
+    for s in signals:
+        by_chat[s["chat_id"]].append(s)
+    for c in sorted(closes, key=lambda m: m["time"]):
+        candidates = by_chat.get(c["chat_id"], [])
+        target = None
+        if c["reply_to"]:
+            target = next((s for s in candidates if s["message_id"] == c["reply_to"]), None)
+        elif config.CLOSE_LATEST_ON_PLAIN_CLOSE:
+            earlier = [s for s in candidates if s["time"] < c["time"] and "close_at" not in s]
+            target = earlier[-1] if earlier else None
+        if target and "close_at" not in target:
+            target["close_at"] = c["time"]
+
+
+def max_drawdown(rs):
+    peak = running = worst = 0.0
+    for r in rs:
+        running += r
+        peak = max(peak, running)
+        worst = min(worst, running - peak)
+    return worst
+
+
+def summarize(trades):
+    finished = [t for t in trades if t.result not in ("EXPIRED", None)]
+    n = len(finished)
+    rs = [t.r for t in finished]
+    return {
+        "signals": len(trades), "trades": n, "expired": len(trades) - n,
+        "wins": sum(1 for r in rs if r > 0), "win_rate": (sum(1 for r in rs if r > 0) / n * 100) if n else 0,
+        "tp1": (sum(1 for t in finished if t.tp_hits >= 1) / n * 100) if n else 0,
+        "full_tp": (sum(1 for t in finished if t.result == "TP") / n * 100) if n else 0,
+        "sl": (sum(1 for t in finished if t.result == "SL") / n * 100) if n else 0,
+        "total_r": sum(rs), "avg_r": (sum(rs) / n) if n else 0, "max_dd": max_drawdown(rs),
+        "pips": sum(t.pips for t in finished),
+    }
+
+
+def fmt_row(name, s):
+    return (f"| {name[:28]:<28} | {s['signals']:>4} | {s['trades']:>4} | {s['win_rate']:>5.0f}% | {s['tp1']:>5.0f}% | "
+            f"{s['full_tp']:>5.0f}% | {s['sl']:>5.0f}% | {s['total_r']:>+7.1f} | {s['avg_r']:>+6.2f} | {s['max_dd']:>6.1f} | {s['pips']:>+8.0f} |")
+
+
+HEADER = ("| group                        | sigs | trd  | win%   | TP1%   | fullTP | SL%    | total R | avg R  | maxDD  | pips     |\n"
+          "|------------------------------|------|------|--------|--------|--------|--------|---------|--------|--------|----------|")
+
+
+# ---------------------------------------------------------------------------- main
+def run_backtest(messages, candles, symbol, variants, spread_pips, max_hours, start, end, pip=None):
+    signals, closes = collect_signals(messages, symbol, start, end)
+    attach_close_times(signals, closes)
+    pip = pip or pip_size(symbol)
+    spread = spread_pips * pip
+    times = [c["time"] for c in candles]
+    results = {}  # variant name -> list of (signal message, trade)
+    skipped = 0
+    for name, cfg in variants.items():
+        trades = []
+        for s in signals:
+            i = first_candle_at_or_after(candles, times, s["time"])
+            if i is None or candles[i]["time"] - s["time"] > timedelta(hours=6):
+                skipped += 1
+                continue
+            trades.append((s, simulate(s["signal"], candles, i, cfg, pip, spread, max_hours, s.get("close_at"))))
+        results[name] = trades
+    return signals, results, skipped // max(len(variants), 1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", help="result.json / folder of exports")
+    ap.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--to", dest="end", default=None, help="YYYY-MM-DD (default: today)")
+    ap.add_argument("--symbol", default="XAUUSD", help="only backtest this symbol (default XAUUSD)")
+    ap.add_argument("--candles-csv", help="use candles from this file instead of MetaAPI")
+    ap.add_argument("--spread-pips", type=float, default=2.0, help="assumed spread added to bid candles (default 2)")
+    ap.add_argument("--be-buffer", type=float, action="append", help="BE buffer pips to test (repeatable)")
+    ap.add_argument("--no-staged", action="store_true", help="also test plain SL/TP with no staged stop")
+    ap.add_argument("--tolerance", type=float, default=config.MARKET_TOLERANCE_PIPS)
+    ap.add_argument("--max-tps", type=int, default=config.MAX_TPS)
+    ap.add_argument("--max-hours", type=float, default=48, help="give up on a trade still open after this")
+    ap.add_argument("--out", default="backtest_trades.csv", help="per-trade CSV (default backtest_trades.csv)")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.WARNING)
+
+    start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
+    end = (datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc) + timedelta(days=1)
+           if args.end else datetime.now(timezone.utc))
+
+    variants = {}
+    for buffer in (args.be_buffer or [config.BE_BUFFER_PIPS]):
+        variants[f"staged BE+{buffer:g}"] = SimConfig(be_buffer_pips=buffer, tolerance_pips=args.tolerance,
+                                                       expiry_min=config.PENDING_EXPIRY_MIN, max_tps=args.max_tps)
+    if args.no_staged:
+        variants["no staged SL"] = SimConfig(tolerance_pips=args.tolerance, expiry_min=config.PENDING_EXPIRY_MIN,
+                                             max_tps=args.max_tps, staged=False)
+
+    messages = list(tg_export.load(args.path))
+    if args.candles_csv:
+        candles = load_csv_candles(args.candles_csv)
+    else:
+        broker_name = config.SYMBOL_MAP.get(args.symbol, args.symbol + config.SYMBOL_SUFFIX)
+        candles = asyncio.run(fetch_metaapi_candles(broker_name, start, end + timedelta(hours=args.max_hours)))
+    if not candles:
+        raise SystemExit("No candles for that period")
+    print(f"{len(candles)} candles from {candles[0]['time']:%Y-%m-%d %H:%M} to {candles[-1]['time']:%Y-%m-%d %H:%M}")
+
+    signals, results, skipped = run_backtest(messages, candles, args.symbol, variants, args.spread_pips,
+                                             args.max_hours, start, end)
+    print(f"{len(signals)} {args.symbol} signals in range" + (f", {skipped} outside candle data" if skipped else ""))
+
+    for name, trades in results.items():
+        print(f"\n### {name}\n{HEADER}")
+        by_group = defaultdict(list)
+        for s, t in trades:
+            by_group[s["chat_name"]].append(t)
+        for group, ts in sorted(by_group.items(), key=lambda kv: -summarize(kv[1])["total_r"]):
+            print(fmt_row(group, summarize(ts)))
+        print(fmt_row("ALL", summarize([t for _, t in trades])))
+
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["variant", "group", "time", "message_id", "direction", "order", "fill", "sl", "tps", "result",
+                    "tp_hits", "r", "pips", "events", "text"])
+        for name, trades in results.items():
+            for s, t in trades:
+                w.writerow([name, s["chat_name"], s["time"].isoformat(), s["message_id"], t.direction, t.order_type,
+                            t.fill, t.orig_sl, "/".join(f"{leg['tp']:g}" for leg in t.legs), t.result, t.tp_hits,
+                            t.r, t.pips, " ".join(f"{e[1]}@{e[0][11:16]}" for e in t.events),
+                            " ".join(s["text"].split())[:120]])
+    print(f"\nPer-trade details written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()

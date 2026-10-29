@@ -20,6 +20,10 @@ SEP = r"[^\d\n]{0,8}?"
 RECAP_WORDS = r"\b(HIT|HITS|HITTED|SMASHED|RUNNING|CLOSED|SECURED|BOOKED|DONE)\b"
 
 CLOSE_RE = re.compile(r"\b(CLOSE|CLOSING|EXIT)\b(?!\s+(TO|ABOVE|BELOW|NEAR)\b)")
+# "close half", "close 50%", "take partials", "partial close", "book some profit"
+PARTIAL_RE = re.compile(
+    r"\b(?:CLOSE|CLOSING|TAKE|TAKING|BOOK|BOOKING|SECURE|SECURING|EXIT)\s+(?:SOME\s+|A\s+)?"
+    r"(?:HALF|PARTIAL(?:S|LY)?|SOME|(\d{1,2})\s*%)|\bPARTIAL(?:LY)?\s+(?:CLOSE|CLOSING|EXIT)|\b(\d{1,2})\s*%\s+(?:CLOSE|OUT|OFF)")
 BREAKEVEN_RE = re.compile(r"\b(BREAK\s*EVEN|BREAKEVEN|(SL|STOP\s*LOSS)\s*(TO|AT)\s*(BE|ENTRY|BREAK\s*EVEN))\b")
 
 
@@ -61,6 +65,15 @@ def is_close_message(text):
 
 def is_breakeven_message(text):
     return bool(BREAKEVEN_RE.search(normalize(text)))
+
+
+def partial_close_fraction(text):
+    """0.5 for "close half" / "take partials", 0.3 for "close 30%", None if it's not a partial close."""
+    match = PARTIAL_RE.search(normalize(text))
+    if not match:
+        return None
+    percent = match.group(1) or match.group(2)
+    return int(percent) / 100 if percent else 0.5
 
 
 def parse_signal(raw_text):

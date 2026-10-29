@@ -12,6 +12,7 @@ from metaapi_cloud_sdk.clients.metaapi.trade_exception import TradeException
 import config
 import db
 from broker import pip_size
+from simulator import choose_order
 
 log = logging.getLogger("trader")
 
@@ -44,9 +45,10 @@ class Trader:
         self.broker = broker
         self.notify = notify                 # async fn(text) -> sends a Telegram message to you
         self.paused = False
+        self.kill_switch_tripped = False
         self._lock = asyncio.Lock()          # one signal at a time, so limits can't be raced
-        self._day = None
-        self._day_start_balance = None
+        self._last_account_check = None
+        self._last_snapshot = None
 
     # ------------------------------------------------------------------ opening
     async def open_signal(self, signal, chat_id, group_name, message_id, raw_text):
@@ -65,28 +67,34 @@ class Trader:
             await self.notify(f"[{group_name}]\n{text}")
 
     async def _open(self, sid, signal, symbol):
-        reason = await self._blocked_reason(signal)
+        row = db.get_signal(sid)
+        settings = db.group_settings(row["chat_id"], row["group_name"], config.GROUP_SETTINGS)
+        reason = await self._blocked_reason(signal, settings)
         if reason:
             db.update_signal(sid, status="SKIPPED", error_message=reason)
             return f"⏭ #{sid} skipped {signal.direction} {signal.symbol}: {reason}"
 
         spec = await self.broker.spec(symbol)
-        price = await self.broker.price(symbol)
         pip = pip_size(symbol, spec)
+        price = await self._price_when_spread_ok(symbol, pip)
+        if price is None:
+            db.update_signal(sid, status="SKIPPED", error_message="spread too wide")
+            return f"⏭ #{sid} skipped {signal.direction} {signal.symbol}: spread stayed above {config.MAX_SPREAD_PIPS:g} pips"
         buy = signal.direction == "BUY"
         current = price["ask"] if buy else price["bid"]
 
-        order_type, open_price = self._choose_order(signal, current, pip)
+        order_type, open_price = choose_order(signal, current, pip, config.MARKET_TOLERANCE_PIPS)
         fill_price = open_price if order_type != "MARKET" else current
 
         # Re-check levels against the real price (late signals: TP1 may already be gone).
         if (buy and signal.sl >= fill_price) or (not buy and signal.sl <= fill_price):
             raise ValueError(f"SL {signal.sl} is already on the wrong side of price {fill_price}")
-        tps = [tp for tp in signal.tps if (tp > fill_price if buy else tp < fill_price)][:config.MAX_TPS]
+        max_tps = int(settings.get("max_tps", config.MAX_TPS))
+        tps = [tp for tp in signal.tps if (tp > fill_price if buy else tp < fill_price)][:max_tps]
         if not tps:
             raise ValueError(f"all TPs already passed (price {fill_price})")
 
-        volumes = await self._leg_volumes(len(tps), fill_price, signal.sl, spec, price)
+        volumes = await self._leg_volumes(len(tps), fill_price, signal.sl, spec, price, settings)
         tps = tps[:len(volumes)]
         db.update_signal(sid, order_type=order_type, entry=fill_price, tps=json.dumps(tps))
 
@@ -117,69 +125,68 @@ class Trader:
         db.update_signal(sid, status=status, error_message="; ".join(errors))
         return f"{'✅' if not errors else '⚠️'} {summary}" + ("\n" + "\n".join(errors) if errors else "")
 
-    def _choose_order(self, signal, current, pip):
-        """Decide market / limit / stop from where price is now, instead of trusting keywords."""
-        buy = signal.direction == "BUY"
-        tolerance = config.MARKET_TOLERANCE_PIPS * pip
+    async def _price_when_spread_ok(self, symbol, pip):
+        """Current price, after waiting (briefly) for a blown-out spread to settle. None = gave up."""
+        deadline = asyncio.get_event_loop().time() + config.SPREAD_WAIT_SEC
+        while True:
+            price = await self.broker.price(symbol)
+            spread_pips = (price["ask"] - price["bid"]) / pip
+            if config.MAX_SPREAD_PIPS <= 0 or spread_pips <= config.MAX_SPREAD_PIPS:
+                return price
+            if asyncio.get_event_loop().time() >= deadline:
+                log.warning("%s spread %.1f pips > %.1f, giving up", symbol, spread_pips, config.MAX_SPREAD_PIPS)
+                return None
+            log.info("%s spread %.1f pips, waiting for it to settle", symbol, spread_pips)
+            await asyncio.sleep(5)
 
-        if signal.zone:
-            low, high = signal.zone
-            if low - tolerance <= current <= high + tolerance:
-                return "MARKET", None
-            if (buy and current > high) or (not buy and current < low):
-                return "LIMIT", high if buy else low        # price ran away: wait for it at the zone edge
-            return "MARKET", None                          # price is already better than the zone
-
-        if signal.entry is None or abs(current - signal.entry) <= tolerance:
-            return "MARKET", None
-        better = current < signal.entry if buy else current > signal.entry
-        if signal.order_hint == "STOP" and better:
-            return "STOP", signal.entry                    # breakout entry: wait for price to get there
-        if better:
-            return "MARKET", None
-        return "LIMIT", signal.entry
-
-    async def _leg_volumes(self, legs, entry, sl, spec, price):
+    async def _leg_volumes(self, legs, entry, sl, spec, price, settings):
         step = spec.get("volumeStep") or 0.01
         min_vol = spec.get("minVolume") or 0.01
         max_vol = spec.get("maxVolume") or 100
+        risk_percent = float(settings.get("risk_percent", config.RISK_PERCENT))
+        lot_size = float(settings.get("lot_size", config.LOT_SIZE))
 
-        if config.RISK_PERCENT > 0:
+        if risk_percent > 0:
             info = await self.broker.account_info()
             tick = spec.get("tickSize") or spec.get("point") or pip_size(spec.get("symbol", ""))
             tick_value = price.get("lossTickValue") or price.get("profitTickValue")
             if not tick_value:
                 raise ValueError("broker gave no tick value, can't size by RISK_PERCENT")
             loss_per_lot = abs(entry - sl) / tick * tick_value
-            total = info["balance"] * config.RISK_PERCENT / 100 / loss_per_lot
+            total = info["balance"] * risk_percent / 100 / loss_per_lot
         else:
-            total = config.LOT_SIZE * legs
+            total = lot_size * legs
         total = min(total, config.MAX_LOT_PER_SIGNAL)
 
         # Split across TPs. If the size is too small to split, use fewer TPs rather than breaking the order.
         while legs > 1 and _floor_step(total / legs, step) < min_vol:
             legs -= 1
         per_leg = max(min_vol, min(max_vol, _floor_step(total / legs, step)))
-        if config.RISK_PERCENT > 0 and per_leg * legs > total:
+        if risk_percent > 0 and per_leg * legs > total:
             log.warning("Minimum lot %s means this trade risks more than RISK_PERCENT", min_vol)
         return [per_leg] * legs
 
-    async def _blocked_reason(self, signal):
+    async def _blocked_reason(self, signal, settings):
         if self.paused:
-            return "bot is paused (/resume to restart)"
+            why = "kill switch tripped" if self.kill_switch_tripped else "bot is paused"
+            return f"{why} (/resume to restart)"
+        if not settings.get("enabled", True):
+            return "group is switched off (/group <id> on)"
         if config.ALLOWED_SYMBOLS and signal.symbol not in config.ALLOWED_SYMBOLS:
             return f"{signal.symbol} not in ALLOWED_SYMBOLS"
         if len(db.open_signals()) >= config.MAX_OPEN_SIGNALS:
             return f"already {config.MAX_OPEN_SIGNALS} open signals (MAX_OPEN_SIGNALS)"
         if config.MAX_DAILY_LOSS_PERCENT > 0:
-            info = await self.broker.account_info()
-            today = datetime.now(timezone.utc).date()
-            if self._day != today:
-                self._day, self._day_start_balance = today, info["balance"]
-            loss = (self._day_start_balance - info["equity"]) / self._day_start_balance * 100
+            loss = await self._daily_loss_percent()
             if loss >= config.MAX_DAILY_LOSS_PERCENT:
                 return f"daily loss limit hit ({loss:.1f}% down today)"
         return None
+
+    async def _daily_loss_percent(self, info=None):
+        """How far equity is below the balance the day started with (stored, so restarts don't reset it)."""
+        info = info or await self.broker.account_info()
+        start = db.day_start_balance(datetime.now(timezone.utc).date().isoformat(), info["balance"])
+        return (start - info["equity"]) / start * 100 if start else 0.0
 
     # ------------------------------------------------------------------ group commands
     async def close_signal(self, row, reason="CLOSED_BY_GROUP"):
@@ -204,6 +211,36 @@ class Trader:
         db.log_action("CLOSE", text, row["id"], row["chat_id"], row["group_name"])
         return text
 
+    async def partial_close_signal(self, row, fraction=0.5):
+        """Close part of every open leg. If the lots are too small to split, close the nearest-TP leg instead."""
+        positions, _ = await self._tagged()
+        open_pos = sorted(positions.get(row["id"], []), key=lambda p: parse_client_id(p["clientId"])[1] or 0)
+        if not open_pos:
+            return f"⚠️ #{row['id']} {row['symbol']}: nothing open to partially close"
+        spec = await self.broker.spec(row["broker_symbol"])
+        step, min_vol = spec.get("volumeStep") or 0.01, spec.get("minVolume") or 0.01
+        done, errors = [], []
+        for pos in open_pos:
+            part = _floor_step(pos["volume"] * fraction, step)
+            if part < min_vol or pos["volume"] - part < min_vol:
+                continue
+            try:
+                await self.broker.close_position_partially(pos["id"], part)
+                done.append(f"{part:g} of {pos['volume']:g}")
+            except Exception as e:
+                errors.append(str(e))
+        if not done and not errors:
+            pos = open_pos[0]
+            try:
+                await self.broker.close_position(pos["id"])
+                done.append(f"TP{parse_client_id(pos['clientId'])[1]} leg ({pos['volume']:g} lots) closed in full")
+            except Exception as e:
+                errors.append(str(e))
+        text = (f"✂️ #{row['id']} {row['symbol']} partial close ({fraction:.0%}): " + (", ".join(done) or "nothing")
+                + (f"\nErrors: {'; '.join(errors)}" if errors else ""))
+        db.log_action("PARTIAL", text, row["id"], row["chat_id"], row["group_name"])
+        return text
+
     async def breakeven_signal(self, row):
         positions, _ = await self._tagged()
         moved = await self._move_sl(row, positions.get(row["id"], []), row["entry"])
@@ -219,11 +256,34 @@ class Trader:
         """Every few seconds: detect fills/TP hits, move SL in stages, expire stale pending orders."""
         while True:
             try:
+                await self._housekeeping()
                 if db.open_signals():
                     await self._manage_once()
             except Exception:
                 log.exception("Trade manager error")
             await asyncio.sleep(config.MANAGER_INTERVAL_SEC)
+
+    async def _housekeeping(self):
+        """Kill switch + equity snapshots. Polls the account at most every 30 s."""
+        now = datetime.now(timezone.utc)
+        if self._last_account_check and (now - self._last_account_check).total_seconds() < 30:
+            return
+        self._last_account_check = now
+        info = await self.broker.account_info()
+
+        if not self._last_snapshot or (now - self._last_snapshot).total_seconds() >= config.EQUITY_SNAPSHOT_MIN * 60:
+            db.add_equity(info["balance"], info["equity"])
+            self._last_snapshot = now
+
+        if config.KILL_SWITCH_LOSS_PERCENT > 0 and not self.kill_switch_tripped:
+            loss = await self._daily_loss_percent(info)
+            if loss >= config.KILL_SWITCH_LOSS_PERCENT:
+                self.kill_switch_tripped = self.paused = True
+                results = await self.close_all()
+                text = (f"🛑 KILL SWITCH: equity {loss:.1f}% below today's starting balance. "
+                        f"Closed everything and paused. Send /resume when you've had a look.\n" + "\n".join(results))
+                db.log_action("KILL_SWITCH", text)
+                await self.notify(text)
 
     async def _tagged(self):
         positions, orders = {}, {}

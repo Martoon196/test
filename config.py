@@ -42,6 +42,11 @@ MAX_SIGNAL_AGE_SEC = _int("MAX_SIGNAL_AGE_SEC", 120)
 EDIT_WINDOW_SEC = _int("EDIT_WINDOW_SEC", 600)
 # A plain "close" message (not a reply) closes the latest open trade from that same group.
 CLOSE_LATEST_ON_PLAIN_CLOSE = _bool("CLOSE_LATEST_ON_PLAIN_CLOSE", True)
+# Shadow mode: follow EVERY signal from EVERY group on live prices (without trading it) so /scorecard
+# can rank the groups by real results before you trust them with money.
+SHADOW_MODE = _bool("SHADOW_MODE", True)
+SHADOW_INTERVAL_SEC = _int("SHADOW_INTERVAL_SEC", 10)
+SHADOW_MAX_HOURS = _int("SHADOW_MAX_HOURS", 72)   # give up on a shadow trade still open after this
 
 # --- MetaAPI ---
 METAAPI_TOKEN = _str("API_KEY")
@@ -58,6 +63,15 @@ MAX_LOT_PER_SIGNAL = _float("MAX_LOT_PER_SIGNAL", 1.0)
 MAX_TPS = _int("MAX_TPS", 3)                   # max number of TP legs to open per signal
 MAX_OPEN_SIGNALS = _int("MAX_OPEN_SIGNALS", 3)
 MAX_DAILY_LOSS_PERCENT = _float("MAX_DAILY_LOSS_PERCENT", 5.0)  # stop taking new trades after this; 0 = off
+# Kill switch: equity down this much from the day's starting balance -> close everything and pause. 0 = off
+KILL_SWITCH_LOSS_PERCENT = _float("KILL_SWITCH_LOSS_PERCENT", 10.0)
+# Don't enter while the spread is wider than this (gold blows out around news). 0 = off
+MAX_SPREAD_PIPS = _float("MAX_SPREAD_PIPS", 0)
+SPREAD_WAIT_SEC = _int("SPREAD_WAIT_SEC", 60)   # how long to wait for the spread to settle before skipping
+# Per-group overrides, keyed by chat id or group name, e.g.
+# {"-1001234567890": {"enabled": false}, "Gold Kings": {"lot_size": 0.02, "risk_percent": 0.5, "max_tps": 2}}
+# Can also be changed at runtime with /group <id|name> on|off|lot 0.02|risk 0.5|tps 2 (stored in the DB).
+GROUP_SETTINGS = json.loads(os.getenv("GROUP_SETTINGS") or "{}")
 ALLOWED_SYMBOLS = _list("ALLOWED_SYMBOLS")     # empty = every symbol the parser knows
 # If price is within this many pips of the signal entry, just go in at market.
 MARKET_TOLERANCE_PIPS = _float("MARKET_TOLERANCE_PIPS", 20)
@@ -66,6 +80,13 @@ PENDING_EXPIRY_MIN = _int("PENDING_EXPIRY_MIN", 240)
 # --- Staged stop loss ---
 BE_BUFFER_PIPS = _float("BE_BUFFER_PIPS", 5)   # TP1 hit -> SL to entry + this many pips
 MANAGER_INTERVAL_SEC = _int("MANAGER_INTERVAL_SEC", 10)
+
+# --- Dashboard (web page with open trades, equity curve, group stats) ---
+# Set a long random token to enable it. Railway gives you the URL (RAILWAY_PUBLIC_DOMAIN) and the PORT.
+DASHBOARD_TOKEN = _str("DASHBOARD_TOKEN")
+PORT = _int("PORT", 8080)
+PUBLIC_DOMAIN = _str("RAILWAY_PUBLIC_DOMAIN")
+EQUITY_SNAPSHOT_MIN = _int("EQUITY_SNAPSHOT_MIN", 5)
 
 # --- Storage ---
 # On Railway, mount a Volume (e.g. at /data) and set DB_PATH=/data/trades.db or the log is wiped on every deploy.

@@ -17,6 +17,7 @@ class FakeBroker:
         self.bid, self.ask = bid, ask
         self.positions_, self.orders_, self.deals, self.calls = [], [], {}, []
         self.next_id = 100
+        self.balance = self.equity = 10000
 
     async def spec(self, symbol):
         return {"symbol": symbol, "minVolume": 0.01, "maxVolume": 50, "volumeStep": 0.01,
@@ -26,7 +27,7 @@ class FakeBroker:
         return {"bid": self.bid, "ask": self.ask, "lossTickValue": 0.01}
 
     async def account_info(self):
-        return {"balance": 10000, "equity": 10000}
+        return {"balance": self.balance, "equity": self.equity}
 
     async def positions(self):
         return self.positions_
@@ -55,6 +56,12 @@ class FakeBroker:
         self.calls.append(("close", position_id))
         self.positions_ = [p for p in self.positions_ if p["id"] != position_id]
 
+    async def close_position_partially(self, position_id, volume):
+        self.calls.append(("partial", position_id, volume))
+        for p in self.positions_:
+            if p["id"] == position_id:
+                p["volume"] = round(p["volume"] - volume, 2)
+
     async def cancel_order(self, order_id):
         self.calls.append(("cancel", order_id))
         self.orders_ = [o for o in self.orders_ if o["id"] != order_id]
@@ -64,7 +71,9 @@ def setup(tmp_path, bid=2040.0, ask=2040.3):
     config.DB_PATH = str(tmp_path / "t.db")
     config.DRY_RUN, config.RISK_PERCENT, config.LOT_SIZE = False, 0.0, 0.01
     config.MAX_DAILY_LOSS_PERCENT, config.MAX_OPEN_SIGNALS = 5.0, 3
-    db._conn = None
+    config.MAX_SPREAD_PIPS, config.SPREAD_WAIT_SEC, config.KILL_SWITCH_LOSS_PERCENT = 0, 0, 10.0
+    config.GROUP_SETTINGS = {}
+    db.reset()
     db.init_db()
     broker = FakeBroker(bid, ask)
     notes = []
@@ -172,3 +181,70 @@ def test_max_open_signals(tmp_path):
     run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 11, "x"))
     assert db.get_signal(2)["status"] == "SKIPPED"
     config.MAX_OPEN_SIGNALS = 3
+
+
+def test_group_switched_off_is_skipped(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    config.GROUP_SETTINGS = {"Bad Group": {"enabled": False}}
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "Bad Group", 10, "x"))
+    assert broker.calls == [] and db.get_signal(1)["status"] == "SKIPPED"
+    # /group <id> on at runtime beats the env default
+    db.set_group_setting(1, "Bad Group", "enabled", True)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "Bad Group", 11, "x"))
+    assert len(broker.calls) == 1
+
+
+def test_per_group_lot_size_and_max_tps(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    db.set_group_setting(-100, "G", "lot_size", 0.05)
+    db.set_group_setting(-100, "G", "max_tps", 2)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050 TP3 2060"), -100, "G", 10, "x"))
+    assert [(c[3], c[6]) for c in broker.calls] == [(0.05, 2045), (0.05, 2050)]
+
+
+def test_wide_spread_skips_the_trade(tmp_path):
+    trader, broker, _ = setup(tmp_path, bid=2040.0, ask=2041.5)   # 15 pip spread
+    config.MAX_SPREAD_PIPS = 8
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    assert broker.calls == [] and db.get_signal(1)["status"] == "SKIPPED"
+    assert "spread" in db.get_signal(1)["error_message"]
+
+
+def test_partial_close(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    db.set_group_setting(1, "G", "lot_size", 0.1)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050"), 1, "G", 10, "x"))
+    run(trader.partial_close_signal(db.get_signal(1), 0.5))
+    assert [c for c in broker.calls if c[0] == "partial"] == [("partial", "101", 0.05), ("partial", "102", 0.05)]
+    assert [p["volume"] for p in broker.positions_] == [0.05, 0.05]
+
+
+def test_partial_close_with_minimum_lots_closes_nearest_leg(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP1 2045 TP2 2050"), 1, "G", 10, "x"))
+    run(trader.partial_close_signal(db.get_signal(1), 0.5))
+    assert ("close", "101") in broker.calls
+    assert [p["clientId"] for p in broker.positions_] == ["TG1_2"]
+
+
+def test_kill_switch_closes_everything_and_pauses(tmp_path):
+    trader, broker, notes = setup(tmp_path)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    run(trader._housekeeping())                       # records today's start balance (10000)
+    broker.equity = 8900                              # -11%
+    trader._last_account_check = None
+    run(trader._housekeeping())
+    assert trader.paused and trader.kill_switch_tripped
+    assert broker.positions_ == []
+    assert any("KILL SWITCH" in n for n in notes)
+    run(trader.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 11, "x"))
+    assert db.get_signal(2)["status"] == "SKIPPED"
+
+
+def test_daily_loss_limit_survives_restart(tmp_path):
+    trader, broker, _ = setup(tmp_path)
+    run(trader._daily_loss_percent())                 # day starts at 10000
+    broker.balance = broker.equity = 9400             # new Trader object after a redeploy
+    trader2 = Trader(broker, trader.notify)
+    run(trader2.open_signal(parse_signal("GOLD BUY 2040 SL 2030 TP 2045"), 1, "G", 10, "x"))
+    assert "daily loss" in db.get_signal(1)["error_message"]

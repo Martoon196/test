@@ -107,6 +107,9 @@ class Broker:
     async def close_position(self, position_id):
         return await self._trade("close_position", position_id)
 
+    async def close_position_partially(self, position_id, volume):
+        return await self._trade("close_position_partially", position_id, volume)
+
     async def cancel_order(self, order_id):
         return await self._trade("cancel_order", order_id)
 

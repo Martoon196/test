@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from signal_parser import is_breakeven_message, is_close_message, parse_signal  # noqa: E402
+from signal_parser import is_breakeven_message, is_close_message, parse_signal, partial_close_fraction  # noqa: E402
 
 
 def test_simple_gold_buy():
@@ -95,3 +95,13 @@ def test_breakeven_detection():
     assert is_breakeven_message("sl to entry guys")
     assert is_breakeven_message("Set breakeven now")
     assert not is_breakeven_message("XAUUSD BUY 2040 SL 2030 TP 2050")
+
+
+def test_partial_close_detection():
+    assert partial_close_fraction("Close half now guys") == 0.5
+    assert partial_close_fraction("Take partials here ✅") == 0.5
+    assert partial_close_fraction("book some profit") == 0.5
+    assert partial_close_fraction("close 30% here") == 0.3
+    assert partial_close_fraction("Partial close gold") == 0.5
+    assert partial_close_fraction("Close gold now") is None
+    assert partial_close_fraction("XAUUSD BUY 2040 SL 2030 TP 2050") is None
