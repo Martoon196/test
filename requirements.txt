@@ -1,0 +1,2 @@
+telethon==1.45.0
+metaapi-cloud-sdk==29.1.1
