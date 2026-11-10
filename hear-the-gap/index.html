@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+</head>
+<body>
+<title>Hear the Gap</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&display=swap">
+<style>
+/* Layout: one readable column of four steps, large controls for older hands and eyes; the dB ladder is the one loud element. */
+:root {
+  --bg: #F2F5F6; --surface: #FFFFFF; --ink: #11252C; --muted: #52666D; --line: #D3DCDF;
+  --accent: #0A6C74; --accent-ink: #FFFFFF; --quiet-bg: #E1F0F1;
+  --loud: #C8402A; --loud-ink: #FFFFFF; --loud-bg: #FBE9E4;
+  --display: "Bricolage Grotesque", "Trebuchet MS", system-ui, sans-serif;
+  --body: "Atkinson Hyperlegible", Verdana, system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0D1A1E; --surface: #15262B; --ink: #E8F0F2; --muted: #9DB0B6; --line: #2A3F45;
+  --accent: #4FC3CB; --accent-ink: #06282B; --quiet-bg: #143338;
+  --loud: #FF8A70; --loud-ink: #2B0D06; --loud-bg: #3A1D16; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0D1A1E; --surface: #15262B; --ink: #E8F0F2; --muted: #9DB0B6; --line: #2A3F45;
+  --accent: #4FC3CB; --accent-ink: #06282B; --quiet-bg: #143338;
+  --loud: #FF8A70; --loud-ink: #2B0D06; --loud-bg: #3A1D16; color-scheme: dark }
+
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 17px; line-height: 1.5;
+  padding-block: 28px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }
+.wrap { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.1 }
+h1 { font-size: clamp(2.2rem, 8vw, 3.4rem); font-weight: 800; letter-spacing: -0.02em }
+h2 { font-size: 1.55rem; font-weight: 800 }
+h3 { font-size: 1.1rem; font-weight: 600 }
+p { margin: 0; max-width: 62ch }
+.lede { font-size: 1.15rem; color: var(--muted) }
+.muted { color: var(--muted) }
+.small { font-size: 0.9rem }
+header { display: flex; flex-direction: column; gap: 10px; padding-block: 8px }
+section.step { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0 }
+.stepnum { font-family: var(--display); font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent) }
+.stack { display: flex; flex-direction: column; gap: 12px; min-width: 0 }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center }
+
+button, .filebtn { font: inherit; font-weight: 700; min-height: 50px; padding: 10px 18px; border-radius: 10px; border: 2px solid var(--accent);
+  background: var(--surface); color: var(--accent); cursor: pointer }
+button.primary { background: var(--accent); color: var(--accent-ink) }
+button.loud { background: var(--loud); border-color: var(--loud); color: var(--loud-ink) }
+button.big { min-height: 84px; font-size: 1.3rem; width: 100% }
+button:disabled { opacity: 0.45; cursor: not-allowed }
+button:focus-visible, input:focus-visible, select:focus-visible, .filebtn:focus-within { outline: 3px solid var(--ink); outline-offset: 2px }
+button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg) }
+
+.tabs { display: flex; flex-wrap: wrap; gap: 8px }
+.tabs button { min-height: 44px; padding: 6px 14px; border-color: var(--line); color: var(--ink); font-weight: 400 }
+.tabs button[aria-selected="true"] { border-color: var(--accent); background: var(--quiet-bg); font-weight: 700 }
+.panel { display: flex; flex-direction: column; gap: 14px; min-width: 0 }
+
+label { font-weight: 700; display: flex; flex-direction: column; gap: 4px }
+input[type="number"], select { font: inherit; font-size: 1.25rem; padding: 8px 10px; min-height: 50px; width: 7.5rem; border: 2px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--ink) }
+select { width: auto; max-width: 100% }
+input[type="range"] { width: 100%; height: 44px; accent-color: var(--accent) }
+.filebtn { display: inline-flex; align-items: center; font-weight: 400; border-color: var(--line); color: var(--ink) }
+.filebtn input { position: absolute; opacity: 0; width: 1px; height: 1px }
+
+.note { background: var(--quiet-bg); border-radius: 10px; padding: 12px 14px }
+.warn { background: var(--loud-bg); border-radius: 10px; padding: 12px 14px }
+.saved { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px }
+.saved div { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px }
+.saved b, .figure { font-family: var(--display); font-size: 1.6rem; font-weight: 800; font-variant-numeric: tabular-nums; display: block }
+
+.meter { height: 18px; border-radius: 9px; background: var(--line); overflow: hidden }
+.meter i { display: block; height: 100%; width: 0; background: var(--accent) }
+
+.headline { font-family: var(--display); font-weight: 800; font-size: clamp(1.5rem, 5.5vw, 2.1rem); line-height: 1.15; text-wrap: balance }
+.headline em { font-style: normal; color: var(--loud) }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px }
+.stats div { border-top: 3px solid var(--ink); padding-top: 8px }
+
+.ladder { display: flex; flex-direction: column; gap: 6px; font-variant-numeric: tabular-nums }
+.rung { display: grid; grid-template-columns: 4.2rem 1fr; gap: 10px; align-items: center }
+.rung .db { text-align: right; color: var(--muted) }
+.rung .bar { min-width: 0 }
+.rung .bar i { display: block; height: 8px; border-radius: 4px; background: var(--line); margin-bottom: 2px }
+.rung.fam .bar i { background: var(--accent); height: 14px }
+.rung.them .bar i { background: var(--loud); height: 14px }
+.rung.fam, .rung.them { font-weight: 700 }
+.rung.them .db, .rung.them .lbl { color: var(--loud) }
+.rung.fam .db, .rung.fam .lbl { color: var(--accent) }
+
+.chartbox { overflow-x: auto }
+svg.chart { width: 100%; max-width: 460px; height: auto; display: block }
+svg.chart text { fill: var(--muted); font-family: var(--body); font-size: 11px }
+svg.chart .grid { stroke: var(--line); stroke-width: 1; fill: none }
+svg.chart .zero { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; fill: none }
+svg.chart .ln { stroke: var(--loud); stroke-width: 2.5; fill: none }
+svg.chart .pt { fill: var(--loud) }
+ul { margin: 0; padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; max-width: 62ch }
+textarea { font: inherit; font-size: 0.95rem; width: 100%; min-height: 9em; border: 2px solid var(--line); border-radius: 10px; padding: 10px; background: var(--bg); color: var(--ink) }
+@media (prefers-reduced-motion: no-preference) { .meter i { transition: width 0.08s linear } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Hear the Gap</h1>
+    <p class="lede">When someone's hearing fades, the TV creeps up and they don't notice. This measures how far it has crept, then plays that same jump back to them so they can feel what the rest of the house lives with.</p>
+  </header>
+
+  <section class="step" aria-labelledby="h-s1">
+    <div class="stack"><span class="stepnum">Step 1</span><h2 id="h-s1">Find the gap</h2>
+      <p>The gap is how much louder their TV setting is than the setting everyone else would pick, in decibels (dB). Pick whichever way is easiest.</p></div>
+    <div class="tabs" role="tablist" aria-label="Ways to find the gap">
+      <button id="tab-tv" role="tab" aria-selected="true" aria-controls="panel-tv">TV volume numbers</button>
+      <button id="tab-match" role="tab" aria-selected="false" aria-controls="panel-match">Comfort match</button>
+      <button id="tab-mic" role="tab" aria-selected="false" aria-controls="panel-mic">Phone microphone</button>
+    </div>
+
+    <div class="panel" id="panel-tv" role="tabpanel" aria-labelledby="tab-tv">
+      <p>Type the number on the TV's volume display for each person.</p>
+      <div class="row">
+        <label for="tvNormal">Everyone else's volume<input id="tvNormal" type="number" inputmode="decimal" min="0" max="100" value="12"></label>
+        <label for="tvTheirs">Their volume<input id="tvTheirs" type="number" inputmode="decimal" min="0" max="100" value="30"></label>
+        <label for="tvStep">dB per volume step<input id="tvStep" type="number" inputmode="decimal" min="0.1" max="3" step="0.1" value="1"></label>
+      </div>
+      <p class="small muted">TV volume numbers are not a standard unit. Most sets change by roughly 0.5 to 1.5 dB per step, so 1 is a fair guess. The other two methods measure the real thing.</p>
+    </div>
+
+    <div class="panel" id="panel-match" role="tabpanel" aria-labelledby="tab-match" hidden>
+      <p>Two people set the same sound to the level they would choose for the TV. Use this device's speaker, sit where you would sit, and leave the device's own volume buttons alone between the two turns.</p>
+      <div class="row">
+        <button id="matchPlay" class="primary" aria-pressed="false">Play sound</button>
+        <label for="progKind" class="small">Sound<select id="progKind"><option value="speech">Voices</option><option value="music">Music</option><option value="file">My own audio file</option></select></label>
+        <label class="filebtn" id="fileWrap" hidden>Choose audio file<input id="progFile" type="file" accept="audio/*"></label>
+      </div>
+      <label for="matchLevel">Slide until it sounds right for the TV<input id="matchLevel" type="range" min="-50" max="0" step="1" value="-35"></label>
+      <div class="row">
+        <button id="matchSaveRef">Save as the good-hearing level</button>
+        <button id="matchSaveSubj">Save as their level</button>
+      </div>
+      <div class="saved">
+        <div><span class="small muted">Good-hearing level</span><b id="matchRefOut">not set</b></div>
+        <div><span class="small muted">Their level</span><b id="matchSubjOut">not set</b></div>
+      </div>
+      <p class="small muted" id="matchMsg">Have the person with good hearing go first.</p>
+    </div>
+
+    <div class="panel" id="panel-mic" role="tabpanel" aria-labelledby="tab-mic" hidden>
+      <p>Put the phone where people sit, play the same programme, and measure twice. Each reading takes five seconds. The phone can't give true decibels, but the difference between two readings is accurate.</p>
+      <div class="meter" aria-hidden="true"><i id="micBar"></i></div>
+      <div class="row">
+        <button id="micRef">Measure at everyone else's volume</button>
+        <button id="micSubj">Measure at their volume</button>
+      </div>
+      <div class="saved">
+        <div><span class="small muted">Everyone else's volume</span><b id="micRefOut">not measured</b></div>
+        <div><span class="small muted">Their volume</span><b id="micSubjOut">not measured</b></div>
+      </div>
+      <p class="small muted" id="micMsg">You will be asked to allow the microphone. Nothing is recorded or sent anywhere.</p>
+    </div>
+  </section>
+
+  <section class="step" aria-labelledby="h-s2">
+    <div class="stack"><span class="stepnum">Step 2</span><h2 id="h-s2">Play it back to them</h2>
+      <p>This is for the person who likes the TV loud. First set a level they are happy with. Then the page jumps the sound up by the gap. That jump is what their setting does to everyone else.</p></div>
+    <div class="row">
+      <label for="gapInput">Gap in dB<input id="gapInput" type="number" inputmode="decimal" min="0" max="60" step="0.5" value="18"></label>
+      <p class="small muted" id="gapSource" style="flex:1 1 220px"></p>
+    </div>
+    <div class="warn"><b>Use the speaker, not headphones.</b> The loud clip stops by itself after five seconds. If it hurts, press it again to stop.</div>
+    <div class="stack">
+      <h3>First: get it comfortable</h3>
+      <p>Press play, then use the volume buttons on this device until it sounds like a TV they would be happy with.</p>
+      <button id="hearQuiet" class="primary big" aria-pressed="false">Play at my comfortable level</button>
+    </div>
+    <div class="stack">
+      <h3>Then: hear what everyone else gets</h3>
+      <p id="hearExplain"></p>
+      <button id="hearLoud" class="loud big" aria-pressed="false">Play what everyone else hears</button>
+    </div>
+  </section>
+
+  <section class="step" aria-labelledby="h-s3">
+    <div class="stack"><span class="stepnum">Step 3</span><h2 id="h-s3">Quick hearing check</h2>
+      <p>Five beeping tones, from low to high, each starting silent and getting louder. Press the button the moment you hear the beeps. It takes about a minute.</p>
+      <p>A phone can't measure hearing on its own, so someone with good hearing does it first as the yardstick. Same device, same volume setting (about half), same quiet room.</p></div>
+    <div class="row" role="group" aria-label="Who is taking the check">
+      <button id="whoRef" aria-pressed="true">Good-hearing helper</button>
+      <button id="whoSubj" aria-pressed="false">Person being checked</button>
+    </div>
+    <div class="stack" id="checkIdle">
+      <button id="checkStart" class="primary">Start the check</button>
+      <p class="small muted" id="checkStatus"></p>
+    </div>
+    <div class="stack" id="checkRun" hidden>
+      <p><b id="checkProgress">Tone 1 of 5</b></p>
+      <div class="meter" aria-hidden="true"><i id="checkBar"></i></div>
+      <button id="checkHear" class="primary big">I can hear it</button>
+      <button id="checkCancel">Cancel</button>
+    </div>
+  </section>
+
+  <section class="step" aria-labelledby="h-s4">
+    <div class="stack"><span class="stepnum">Result</span><h2 id="h-s4">What it adds up to</h2></div>
+    <p class="headline" id="resHeadline"></p>
+    <div class="stats" id="resStats"></div>
+    <div class="stack">
+      <h3>Where that puts the living room</h3>
+      <p class="small muted">Assuming a TV at a typical volume sits around 60 dB where you sit, about the level of normal conversation.</p>
+      <div class="ladder" id="ladder"></div>
+    </div>
+    <div class="stack" id="resHearing"></div>
+    <div class="stack">
+      <h3>What to do with this</h3>
+      <ul>
+        <li>Book a proper hearing test. Many opticians and pharmacies do them free, and a GP can refer you to audiology.</li>
+        <li>Hearing loss usually takes the high pitches first. That removes the consonants, so speech sounds mumbled and turning it up only makes the mumble louder. Hearing aids put back the pitches that are missing.</li>
+        <li>Until then, turn on subtitles, or try a TV speech mode or a small speaker beside their chair.</li>
+      </ul>
+    </div>
+    <div class="row"><button id="copyBtn">Copy the result as text</button><span class="small muted" id="copyMsg" role="status"></span></div>
+    <textarea id="copyArea" hidden readonly aria-label="Result text"></textarea>
+    <p class="small muted">This is a demonstration and a rough screen. It is not a medical test and can't diagnose anything.</p>
+  </section>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var db2g = function (db) { return Math.pow(10, db / 20); };
+  var FREQS = [500, 1000, 2000, 4000, 8000];
+  var MAX_GAP = 30;
+
+  var state = { gap: 18, source: 'example', match: { ref: null, subj: null }, mic: { ref: null, subj: null }, check: { ref: null, subj: null } };
+  try { var saved = JSON.parse(localStorage.getItem('hearTheGap') || 'null'); if (saved && saved.check) state.check = saved.check; } catch (e) {}
+  function persist() { try { localStorage.setItem('hearTheGap', JSON.stringify({ check: state.check })); } catch (e) {} }
+
+  /* ---------- audio engine ---------- */
+  var ctx = null, current = null, fileBuffer = null;
+  function ac() {
+    if (!ctx) { var AC = window.AudioContext || window.webkitAudioContext; ctx = new AC(); }
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+
+  // Speech-like babble: a buzzing voice through three moving formants, plus hissy consonant bursts.
+  function speechSource(c, live) {
+    var out = c.createGain(); out.gain.value = 2.0;
+    var osc = c.createOscillator(); osc.type = 'sawtooth'; osc.frequency.value = 120;
+    var env = c.createGain(); env.gain.value = 0;
+    var fs = [0, 1, 2].map(function (i) {
+      var f = c.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = [5, 8, 9][i]; f.frequency.value = [500, 1500, 2600][i];
+      var g = c.createGain(); g.gain.value = [1, 0.7, 0.45][i];
+      osc.connect(f); f.connect(g); g.connect(env); return f;
+    });
+    env.connect(out);
+    var nb = c.createBuffer(1, c.sampleRate, c.sampleRate), d = nb.getChannelData(0);
+    for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    var noise = c.createBufferSource(); noise.buffer = nb; noise.loop = true;
+    var hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 3500;
+    var nenv = c.createGain(); nenv.gain.value = 0;
+    noise.connect(hp); hp.connect(nenv); nenv.connect(out);
+    osc.start(); noise.start();
+    var V = [[750, 1200, 2600], [450, 1700, 2500], [300, 2200, 2900], [480, 850, 2600], [330, 800, 2400]];
+    var t = c.currentTime + 0.05, left = 6, f0 = 120, timer = null;
+    function sched(horizon) {
+      while (t < c.currentTime + horizon) {
+        if (left-- <= 0) { t += 0.3 + Math.random() * 0.4; left = 4 + Math.floor(Math.random() * 7); f0 = 100 + Math.random() * 90; }
+        var dur = 0.13 + Math.random() * 0.12, v = V[Math.floor(Math.random() * V.length)];
+        if (Math.random() < 0.55) {
+          nenv.gain.setValueAtTime(0, t); nenv.gain.linearRampToValueAtTime(0.22, t + 0.012); nenv.gain.linearRampToValueAtTime(0, t + 0.06); t += 0.06;
+        }
+        for (var k = 0; k < 3; k++) fs[k].frequency.setTargetAtTime(v[k], t, 0.02);
+        osc.frequency.setTargetAtTime(f0 * (0.9 + Math.random() * 0.25), t, 0.03);
+        env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(0.5, t + 0.03);
+        env.gain.setValueAtTime(0.5, t + dur - 0.04); env.gain.linearRampToValueAtTime(0, t + dur);
+        t += dur + 0.02;
+      }
+    }
+    sched(live ? 0.5 : 12);
+    if (live) timer = setInterval(function () { sched(0.5); }, 150);
+    return { out: out, stop: function () { clearInterval(timer); try { osc.stop(); noise.stop(); } catch (e) {} } };
+  }
+
+  function musicSource(c, live) {
+    var out = c.createGain(); out.gain.value = 0.9;
+    var scale = [220, 261.63, 293.66, 329.63, 392, 440, 523.25, 587.33, 659.25];
+    var t = c.currentTime + 0.05, n = 0, timer = null, oscs = [];
+    function note(freq, at, dur, type, vol) {
+      var o = c.createOscillator(), g = c.createGain(); o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(0, at); g.gain.linearRampToValueAtTime(vol, at + 0.02); g.gain.exponentialRampToValueAtTime(0.001, at + dur);
+      o.connect(g); g.connect(out); o.start(at); o.stop(at + dur + 0.05); oscs.push(o); if (oscs.length > 40) oscs.shift();
+    }
+    function sched(horizon) {
+      while (t < c.currentTime + horizon) {
+        if (n % 4 === 0) note(scale[[0, 1, 3, 2][(n / 4) % 4]] / 2, t, 0.9, 'triangle', 0.5);
+        note(scale[(n * 2 + Math.floor(Math.random() * 3)) % scale.length], t, 0.35, 'triangle', 0.4);
+        if (n % 2 === 1) note(scale[(n * 5) % scale.length] * 2, t, 0.2, 'sine', 0.2);
+        n++; t += 0.24;
+      }
+    }
+    sched(live ? 0.5 : 12);
+    if (live) timer = setInterval(function () { sched(0.5); }, 150);
+    return { out: out, stop: function () { clearInterval(timer); oscs.forEach(function (o) { try { o.stop(); } catch (e) {} }); } };
+  }
+
+  function fileSource(c) {
+    var out = c.createGain(), src = c.createBufferSource(); src.buffer = fileBuffer; src.loop = true;
+    var peak = 0.001;
+    for (var ch = 0; ch < fileBuffer.numberOfChannels; ch++) { var d = fileBuffer.getChannelData(ch); for (var i = 0; i < d.length; i += 7) { var a = Math.abs(d[i]); if (a > peak) peak = a; } }
+    out.gain.value = 0.9 / peak; src.connect(out); src.start();
+    return { out: out, stop: function () { try { src.stop(); } catch (e) {} } };
+  }
+
+  function makeSource(c, live) {
+    var kind = $('progKind').value;
+    if (kind === 'file' && fileBuffer) return fileSource(c);
+    return kind === 'music' ? musicSource(c, live) : speechSource(c, live);
+  }
+  window.__hearTheGapTest = { speech: speechSource, music: musicSource };
+
+  function stopAll() {
+    if (!current) return;
+    var cur = current; current = null;
+    clearTimeout(cur.timer); clearInterval(cur.tick);
+    try { cur.lvl.gain.cancelScheduledValues(ctx.currentTime); cur.lvl.gain.setTargetAtTime(0, ctx.currentTime, 0.03); } catch (e) {}
+    setTimeout(function () { try { cur.src.stop(); cur.lvl.disconnect(); } catch (e) {} }, 200);
+    if (cur.onStop) cur.onStop();
+  }
+
+  function playProgramme(db, onStop, fade) {
+    stopAll();
+    var c = ac(), lvl = c.createGain(); lvl.gain.value = 0; lvl.connect(c.destination);
+    var src = makeSource(c, true); src.out.connect(lvl);
+    lvl.gain.setTargetAtTime(db2g(db), c.currentTime, fade || 0.06);
+    current = { lvl: lvl, src: src, onStop: onStop };
+    return current;
+  }
+
+  function toggleBtn(btn, onLabel, offLabel, start) {
+    btn.addEventListener('click', function () {
+      if (btn.getAttribute('aria-pressed') === 'true') { stopAll(); return; }
+      var cur = start();
+      btn.setAttribute('aria-pressed', 'true'); btn.textContent = onLabel;
+      var prev = cur.onStop;
+      cur.onStop = function () { btn.setAttribute('aria-pressed', 'false'); btn.textContent = offLabel; if (prev) prev(); };
+    });
+  }
+
+  /* ---------- step 1: the gap ---------- */
+  function setGap(g, source) {
+    if (!isFinite(g)) return;
+    state.gap = Math.max(0, Math.round(g * 10) / 10); state.source = source;
+    if (document.activeElement !== $('gapInput')) $('gapInput').value = state.gap;
+    render();
+  }
+
+  var tabs = ['tv', 'match', 'mic'];
+  tabs.forEach(function (name) {
+    $('tab-' + name).addEventListener('click', function () {
+      tabs.forEach(function (n) { $('tab-' + n).setAttribute('aria-selected', String(n === name)); $('panel-' + n).hidden = n !== name; });
+      if (name !== 'match') stopAll();
+    });
+  });
+
+  function tvCalc(source) {
+    var a = parseFloat($('tvNormal').value), b = parseFloat($('tvTheirs').value), s = parseFloat($('tvStep').value);
+    if (isFinite(a) && isFinite(b) && isFinite(s)) setGap((b - a) * s, source);
+  }
+  ['tvNormal', 'tvTheirs', 'tvStep'].forEach(function (id) { $(id).addEventListener('input', function () { tvCalc('tv'); }); });
+  $('gapInput').addEventListener('input', function () { setGap(parseFloat($('gapInput').value), 'typed'); });
+
+  toggleBtn($('matchPlay'), 'Stop sound', 'Play sound', function () { return playProgramme(parseFloat($('matchLevel').value)); });
+  $('matchLevel').addEventListener('input', function () {
+    if (current && $('matchPlay').getAttribute('aria-pressed') === 'true') current.lvl.gain.setTargetAtTime(db2g(parseFloat($('matchLevel').value)), ctx.currentTime, 0.03);
+  });
+  $('progKind').addEventListener('change', function () { $('fileWrap').hidden = $('progKind').value !== 'file'; stopAll(); });
+  $('progFile').addEventListener('change', function () {
+    var f = $('progFile').files[0]; if (!f) return;
+    var r = new FileReader();
+    r.onload = function () {
+      ac().decodeAudioData(r.result, function (buf) { fileBuffer = buf; $('matchMsg').textContent = 'Loaded "' + f.name + '". Press Play sound.'; },
+        function () { $('matchMsg').textContent = 'That file could not be read as audio. Try an MP3 or WAV.'; });
+    };
+    r.readAsArrayBuffer(f);
+  });
+  function matchSave(who) {
+    stopAll(); state.match[who] = parseFloat($('matchLevel').value);
+    var m = state.match, lv = function (v) { return v === null ? 'not set' : 'Level ' + (v + 50); };
+    $('matchRefOut').textContent = lv(m.ref); $('matchSubjOut').textContent = lv(m.subj);
+    if (m.ref !== null && m.subj !== null) {
+      var g = m.subj - m.ref;
+      if (g < 0) $('matchMsg').textContent = 'Their level is lower than the good-hearing level, so there is no gap to show.';
+      else $('matchMsg').textContent = 'Gap: ' + g + ' dB' + (m.subj >= 0 ? ' or more. The slider hit the top, so turn the device volume up and repeat both turns for an exact figure.' : '.');
+      setGap(Math.max(0, g), 'match');
+    } else $('matchMsg').textContent = who === 'ref' ? 'Saved. Now hand over without touching the device volume, and have them set their level.' : 'Saved. Now have the person with good hearing set theirs.';
+    if (who === 'ref') $('matchLevel').value = -35;
+  }
+  $('matchSaveRef').addEventListener('click', function () { matchSave('ref'); });
+  $('matchSaveSubj').addEventListener('click', function () { matchSave('subj'); });
+
+  /* microphone: relative level only */
+  var mic = null;
+  function micOpen() {
+    if (mic) return Promise.resolve(mic);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('none'));
+    return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }).then(function (stream) {
+      var c = ac(), an = c.createAnalyser(); an.fftSize = 2048; c.createMediaStreamSource(stream).connect(an);
+      mic = { an: an, buf: new Float32Array(an.fftSize) }; return mic;
+    });
+  }
+  function micMeasure(who) {
+    stopAll();
+    micOpen().then(function (m) {
+      $('micRef').disabled = $('micSubj').disabled = true; $('micMsg').textContent = 'Listening for five seconds…';
+      var sum = 0, n = 0, t0 = performance.now();
+      var iv = setInterval(function () {
+        m.an.getFloatTimeDomainData(m.buf); var s = 0;
+        for (var i = 0; i < m.buf.length; i++) s += m.buf[i] * m.buf[i];
+        s /= m.buf.length; sum += s; n++;
+        var dbNow = 10 * Math.log10(s + 1e-12);
+        $('micBar').style.width = Math.max(0, Math.min(100, (dbNow + 70) / 70 * 100)) + '%';
+        if (performance.now() - t0 >= 5000) {
+          clearInterval(iv); $('micRef').disabled = $('micSubj').disabled = false; $('micBar').style.width = '0';
+          state.mic[who] = 10 * Math.log10(sum / n + 1e-12);
+          $(who === 'ref' ? 'micRefOut' : 'micSubjOut').textContent = 'done';
+          var r = state.mic.ref, sj = state.mic.subj;
+          if (r !== null && sj !== null) { var g = sj - r; $('micMsg').textContent = 'Their volume measured ' + g.toFixed(1) + ' dB ' + (g >= 0 ? 'louder.' : 'quieter, so there is no gap to show.'); setGap(Math.max(0, g), 'mic'); }
+          else $('micMsg').textContent = 'Saved. Change the TV volume and take the other reading from the same spot.';
+        }
+      }, 100);
+    }).catch(function () {
+      $('micMsg').textContent = 'The microphone is not available here. Use TV volume numbers or Comfort match instead.';
+    });
+  }
+  $('micRef').addEventListener('click', function () { micMeasure('ref'); });
+  $('micSubj').addEventListener('click', function () { micMeasure('subj'); });
+
+  /* ---------- step 2: play it back ---------- */
+  function playGap() { return Math.min(MAX_GAP, state.gap || 0); }
+  toggleBtn($('hearQuiet'), 'Stop', 'Play at my comfortable level', function () { return playProgramme(-playGap()); });
+  toggleBtn($('hearLoud'), 'Stop', 'Play what everyone else hears', function () {
+    var cur = playProgramme(0, null, 0.15);
+    cur.timer = setTimeout(stopAll, 5000);
+    return cur;
+  });
+
+  /* ---------- step 3: hearing check ---------- */
+  var who = 'ref', run = null;
+  var FLOOR = -85, CEIL = -3, RATE = 5;
+  function setWho(w) { who = w; $('whoRef').setAttribute('aria-pressed', String(w === 'ref')); $('whoSubj').setAttribute('aria-pressed', String(w === 'subj')); checkStatus(); }
+  $('whoRef').addEventListener('click', function () { setWho('ref'); });
+  $('whoSubj').addEventListener('click', function () { setWho('subj'); });
+  function checkStatus(extra) {
+    var c = state.check, parts = [];
+    parts.push(c.ref ? 'Helper: done.' : 'Helper: not done yet.');
+    parts.push(c.subj ? 'Person being checked: done.' : 'Person being checked: not done yet.');
+    $('checkStatus').textContent = (extra ? extra + ' ' : '') + parts.join(' ');
+  }
+  function nextTone() {
+    var i = run.i, c = ac();
+    $('checkProgress').textContent = 'Tone ' + (i + 1) + ' of ' + FREQS.length; $('checkBar').style.width = (i / FREQS.length * 100) + '%';
+    var osc = c.createOscillator(), lvl = c.createGain(); osc.frequency.value = FREQS[i]; lvl.gain.value = 0;
+    osc.connect(lvl); lvl.connect(c.destination); osc.start();
+    var t0 = performance.now() + 600 + Math.random() * 900;
+    run.level = null;
+    current = { lvl: lvl, src: { stop: function () { try { osc.stop(); } catch (e) {} } } };
+    current.tick = setInterval(function () {
+      var el = (performance.now() - t0) / 1000; if (el < 0) return;
+      var db = FLOOR + RATE * el; run.level = db;
+      if (db >= CEIL) { answer(null); return; }
+      var on = (el % 0.6) < 0.36;
+      lvl.gain.setTargetAtTime(on ? db2g(db) : 0, c.currentTime, 0.012);
+    }, 40);
+  }
+  function answer(value) {
+    run.res[FREQS[run.i]] = value; stopAll(); run.i++;
+    if (run.i < FREQS.length) { setTimeout(function () { if (run) nextTone(); }, 500); return; }
+    state.check[who] = run.res; var floorHit = FREQS.some(function (f) { return run.res[f] !== null && run.res[f] <= FLOOR + 1.5; });
+    run = null; persist(); $('checkRun').hidden = true; $('checkIdle').hidden = false;
+    var msg = 'Saved.';
+    if (floorHit) msg = 'Saved, but a tone was heard straight away. Turn the device volume down and have both people redo it.';
+    else if (who === 'ref') { msg = 'Saved. Now pick "Person being checked" and hand over.'; }
+    checkStatus(msg); render();
+  }
+  $('checkStart').addEventListener('click', function () {
+    stopAll(); run = { i: 0, res: {}, level: null }; $('checkIdle').hidden = true; $('checkRun').hidden = false; nextTone(); $('checkHear').focus();
+  });
+  $('checkHear').addEventListener('click', function () { if (run && run.level !== null) answer(Math.round(run.level * 10) / 10); });
+  $('checkCancel').addEventListener('click', function () { run = null; stopAll(); $('checkRun').hidden = true; $('checkIdle').hidden = false; checkStatus('Cancelled.'); });
+
+  function lossProfile() {
+    var r = state.check.ref, s = state.check.subj; if (!r || !s) return null;
+    var out = {}, sum = 0, n = 0, atLeast = false;
+    FREQS.forEach(function (f) {
+      if (r[f] === null || r[f] === undefined) { out[f] = null; return; }
+      var missed = s[f] === null || s[f] === undefined, v = (missed ? CEIL : s[f]) - r[f];
+      out[f] = { v: Math.round(v), atLeast: missed };
+      if (f <= 4000) { sum += v; n++; if (missed) atLeast = true; }
+    });
+    return { byFreq: out, avg: n ? sum / n : null, atLeast: atLeast };
+  }
+  function grade(avg) {
+    if (avg < 20) return 'in the normal range';
+    if (avg < 35) return 'in the mild hearing loss range';
+    if (avg < 50) return 'in the moderate hearing loss range';
+    if (avg < 65) return 'in the moderately severe hearing loss range';
+    return 'in the severe hearing loss range';
+  }
+  function chartSvg(p) {
+    var W = 360, H = 230, L = 40, R = 14, T = 26, B = 22;
+    var x = function (i) { return L + (W - L - R) * i / (FREQS.length - 1); };
+    var y = function (d) { return T + (H - T - B) * (Math.max(-10, Math.min(90, d)) + 10) / 100; };
+    var s = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Hearing compared with the helper, by pitch. Lower on the chart means worse.">';
+    [0, 20, 40, 60, 80].forEach(function (d) {
+      s += '<line class="' + (d === 0 ? 'zero' : 'grid') + '" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(d) + '" y2="' + y(d) + '"/><text x="' + (L - 6) + '" y="' + (y(d) + 4) + '" text-anchor="end">' + d + '</text>';
+    });
+    var pts = [];
+    FREQS.forEach(function (f, i) {
+      s += '<text x="' + x(i) + '" y="14" text-anchor="middle">' + (f >= 1000 ? f / 1000 + 'k' : f) + ' Hz</text>';
+      var q = p.byFreq[f]; if (!q) return;
+      pts.push(x(i) + ',' + y(q.v));
+      s += '<circle class="pt" cx="' + x(i) + '" cy="' + y(q.v) + '" r="5"/>';
+    });
+    s += '<polyline class="ln" points="' + pts.join(' ') + '"/><text x="' + L + '" y="' + (H - 5) + '">dB quieter than the helper can hear. Further down means worse.</text></svg>';
+    return s;
+  }
+
+  /* ---------- result ---------- */
+  var LANDMARKS = [[30, 'Whisper'], [40, 'Quiet library'], [50, 'Fridge humming'], [70, 'Vacuum cleaner'], [80, 'Busy road from the kerb'], [85, 'Workplaces must offer ear protection'], [90, 'Petrol lawnmower'], [100, 'Nightclub']];
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]; }); }
+  function fmtTimes(x) { return x >= 10 ? Math.round(x) : x.toFixed(1); }
+  function summaryText() {
+    var g = state.gap, lines = ['Hear the Gap result', 'TV gap: ' + g + ' dB louder than the rest of the house needs.',
+      'That sounds about ' + fmtTimes(Math.pow(2, g / 10)) + ' times as loud and carries ' + fmtTimes(Math.pow(10, g / 10)) + ' times the sound energy.',
+      'If a normal TV is around 60 dB, theirs is around ' + Math.round(60 + g) + ' dB.'];
+    var p = lossProfile();
+    if (p && p.avg !== null) {
+      lines.push('Hearing check: tones need to be ' + (p.atLeast ? 'at least ' : 'about ') + Math.round(p.avg) + ' dB louder than for the helper, which is ' + grade(p.avg) + '.');
+      lines.push(FREQS.map(function (f) { var q = p.byFreq[f]; return f + ' Hz: ' + (q ? (q.atLeast ? '>' : '') + q.v + ' dB' : 'n/a'); }).join(', '));
+    }
+    lines.push('A rough screen, not a medical test. A proper hearing test is the next step.');
+    return lines.join('\n');
+  }
+  function render() {
+    var g = state.gap || 0, src = { example: 'Example numbers: a TV at 12 for the family and 30 for them. Replace them in step 1.', tv: 'From the TV volume numbers.', match: 'From the comfort match.', mic: 'From the microphone readings.', typed: 'Typed in by hand.' }[state.source];
+    $('gapSource').textContent = src;
+    var pg = playGap();
+    $('hearExplain').textContent = pg <= 0 ? 'There is no gap yet. Find one in step 1.' :
+      'Without touching the volume, press this. It plays the same sound ' + pg + ' dB louder' + (g > MAX_GAP ? ' (the real gap is ' + g + ' dB, but this page stops at ' + MAX_GAP + ' to protect ears)' : '') + '.';
+    $('hearLoud').disabled = pg <= 0;
+
+    $('resHeadline').innerHTML = g <= 0 ? 'No gap measured yet.' : 'Their TV is <em>' + g + ' dB louder</em> than the rest of the house needs.';
+    $('resStats').innerHTML = g <= 0 ? '' :
+      '<div><span class="figure">' + fmtTimes(Math.pow(2, g / 10)) + '×</span>as loud to the ear</div>' +
+      '<div><span class="figure">' + fmtTimes(Math.pow(10, g / 10)) + '×</span>the sound energy in the room</div>' +
+      '<div><span class="figure">' + Math.round(60 + g) + ' dB</span>roughly, where they sit</div>';
+
+    var rungs = LANDMARKS.map(function (l) { return { db: l[0], label: l[1], cls: '' }; });
+    rungs.push({ db: 60, label: 'TV at a normal volume, and normal talking', cls: 'fam' });
+    if (g > 0) rungs.push({ db: Math.round(60 + g), label: 'Their TV', cls: 'them' });
+    rungs.sort(function (a, b) { return a.db - b.db || (a.cls ? 1 : -1); });
+    $('ladder').innerHTML = rungs.map(function (r) {
+      return '<div class="rung ' + r.cls + '"><span class="db">' + r.db + ' dB</span><span class="bar"><i style="width:' + Math.max(4, Math.min(100, (r.db - 20) / 90 * 100)) + '%"></i><span class="lbl">' + esc(r.label) + '</span></span></div>';
+    }).join('');
+
+    var p = lossProfile(), h = '<h3>Hearing check</h3>';
+    if (p && p.avg !== null) {
+      h += '<p>Across the speech pitches, tones had to be <b>' + (p.atLeast ? 'at least ' : 'about ') + Math.round(p.avg) + ' dB louder</b> for them than for the helper. If the helper hears normally, that is <b>' + grade(p.avg) + '</b>.</p>';
+      h += '<div class="chartbox">' + chartSvg(p) + '</div>';
+      var hi = p.byFreq[4000], lo = p.byFreq[500];
+      if (hi && lo && hi.v - lo.v >= 15) h += '<p class="note">The high pitches are much worse than the low ones. That is the classic pattern where speech sounds mumbled even when it is loud.</p>';
+    } else h += '<p class="muted">Not done yet. Step 3 needs both people to take the check before it can compare them.</p>';
+    $('resHearing').innerHTML = h;
+    if (!$('copyArea').hidden) $('copyArea').value = summaryText();
+  }
+
+  $('copyBtn').addEventListener('click', function () {
+    var text = summaryText(), area = $('copyArea');
+    var fallback = function () { area.hidden = false; area.value = text; area.focus(); area.select(); $('copyMsg').textContent = 'Select the text below and copy it.'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () { $('copyMsg').textContent = 'Copied.'; }, fallback);
+    else fallback();
+  });
+  document.addEventListener('visibilitychange', function () { if (document.hidden && !run) stopAll(); });
+
+  checkStatus(); render();
+})();
+</script>
+</body>
+</html>
